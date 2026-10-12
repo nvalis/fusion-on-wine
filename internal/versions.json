@@ -14,9 +14,10 @@
     "sha256": "431f82fc74000e6c864409f1d8fb495d696c03928808e3e8acffc45179312a7b"
   },
   "dxvk": {
-    "version": "2.7.1",
-    "url": "https://github.com/doitsujin/dxvk/releases/download/v2.7.1/dxvk-2.7.1.tar.gz",
-    "sha256": "d85ce7c79f57ecd765aaa1b9e7007cb875e6fde9f6d331df799bce73d513ce87"
+    "version": "3.1.1",
+    "url": "https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz",
+    "sha256": "40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608",
+    "minimum_vulkan": "1.4"
   },
   "fusion": {
     "url": "https://dl.appstreaming.autodesk.com/production/installers/Fusion%20Client%20Downloader.exe",
@@ -24,7 +25,6 @@
   },
   "python_requirements": [
     "python-xlib==0.33",
-    "Pillow==12.0.0",
     "six==1.17.0"
   ]
 }

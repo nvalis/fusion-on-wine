@@ -1,5 +1,6 @@
 """Launch, configuration, desktop integration, and read-only diagnostics."""
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import json
@@ -15,6 +16,7 @@ import xml.etree.ElementTree as ET
 # Paths and environment
 
 ROOT = Path(__file__).resolve().parent.parent
+FUSION_DLL_OVERRIDES = "d3dcompiler_47,d3dcompiler_43=n,b"
 
 
 def manifest():
@@ -44,7 +46,7 @@ class Settings:
     def server(self):
         return self.runtime / "bin/wineserver"
 
-    def env(self):
+    def env(self, *, fusion=False):
         env = dict(os.environ)
         env.update(WINEPREFIX=str(self.prefix), WINESERVER=str(self.server), WINEARCH="win64",
                    WINEDEBUG=env.get("WINEDEBUG", "-all,+err"), QTWEBENGINE_DISABLE_SANDBOX="1",
@@ -55,6 +57,9 @@ class Settings:
         env.pop("WINEDLLPATH", None)
         env.pop("WINELOADER", None)
         env.pop("WINEDLLOVERRIDES", None)
+        if fusion:
+            # Fusion ships its own compilers. Wine's compiler breaks OGS shading and redraws.
+            env["WINEDLLOVERRIDES"] = FUSION_DLL_OVERRIDES
         return env
 
 
@@ -187,13 +192,15 @@ def decode_xml(data):
     return encoding, data.decode(encoding)
 
 
-def replace_value(path, tag, value):
+def replace_values(path, values):
     data = path.read_bytes()
     encoding, text = decode_xml(data)
-    pattern = re.compile(rf'(<{tag}\b[^>]*\bValue=")[^"]*(")')
-    if len(pattern.findall(text)) != 1:
-        raise RuntimeError(f"Cannot safely update {tag} in {path.name}; its XML format differs.")
-    changed = pattern.sub(lambda m: m.group(1) + value + m.group(2), text)
+    changed = text
+    for tag, value in values.items():
+        pattern = re.compile(rf'(<{tag}\b[^>]*\bValue=")[^"]*(")')
+        if len(pattern.findall(changed)) != 1:
+            raise RuntimeError(f"Cannot safely update {tag} in {path.name}; its XML format differs.")
+        changed = pattern.sub(lambda m: m.group(1) + value + m.group(2), changed)
     if changed == text:
         return
     backup = path.with_name(path.name + ".before-fusion-on-wine")
@@ -202,6 +209,10 @@ def replace_value(path, tag, value):
     temp = path.with_name(path.name + ".tmp")
     temp.write_bytes(changed.encode(encoding))
     temp.replace(path)
+
+
+def replace_value(path, tag, value):
+    replace_values(path, {tag: value})
 
 
 def prepare_preferences(prefix, *, force_graphics=False):
@@ -214,13 +225,12 @@ def prepare_preferences(prefix, *, force_graphics=False):
     machine = options / "NMachineSpecificOptions.xml"
     if not machine.exists():
         text = ('<?xml version="1.0" encoding="UTF-16"?>\r\n<OptionGroups>\r\n'
-                '  <BootstrapOptionsGroup><driverOptionId Value="VirtualDeviceGLCore"/></BootstrapOptionsGroup>\r\n'
-                '  <CompatibilityGroup><graphicsApiOptionId Value="OpenGL"/></CompatibilityGroup>\r\n'
+                '  <BootstrapOptionsGroup><driverOptionId Value="VirtualDeviceDx11"/></BootstrapOptionsGroup>\r\n'
+                '  <CompatibilityGroup><graphicsApiOptionId Value="D3D11"/></CompatibilityGroup>\r\n'
                 '</OptionGroups>\r\n')
         machine.write_bytes(text.encode("utf-16"))
     elif force_graphics:
-        replace_value(machine, "driverOptionId", "VirtualDeviceGLCore")
-        replace_value(machine, "graphicsApiOptionId", "OpenGL")
+        replace_values(machine, {"driverOptionId": "VirtualDeviceDx11", "graphicsApiOptionId": "D3D11"})
     # Account settings appear only after sign-in. Apply this default once per account.
     for path in options.glob("*/NGlobalOptions.xml"):
         marker = path.parent / ".fusion-on-wine-environment-initialized"
@@ -234,7 +244,32 @@ def prepare_preferences(prefix, *, force_graphics=False):
         except (ET.ParseError, RuntimeError) as error:
             print(f"Environment default skipped: {error}")
 
+def bundled_shader_compiler(executable):
+    for folder in (executable.parent, executable.parent / "d3dcompiler_v2", executable.parent / "d3dcompiler_v1"):
+        if folder.is_dir():
+            for path in folder.iterdir():
+                if path.name.lower() == "d3dcompiler_47.dll" and path.is_file():
+                    return path
+    raise RuntimeError("Fusion's bundled d3dcompiler_47.dll is missing. Repair the Autodesk installation; "
+                       "Wine's shader compiler is not a working replacement.")
+
 # Commands
+
+@contextmanager
+def installation_guard(settings):
+    lock_path = settings.home / "install.lock"
+    lock = lock_path.open("r") if lock_path.exists() else None
+    try:
+        if lock is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError("Installation is in progress; wait before changing settings or launching Fusion.") from None
+        yield
+    finally:
+        if lock is not None:
+            lock.close()
+
 
 def check_runtime(settings):
     from .setup import fingerprint
@@ -262,41 +297,27 @@ def launch(settings):
                           stderr=subprocess.DEVNULL).returncode:
             raise RuntimeError("Python Xlib is missing; install the helper environment first.")
     # A running install must not race application startup or runtime replacement.
-    lock_path = settings.home / "install.lock"
-    lock = lock_path.open("r") if lock_path.exists() else None
-    if lock is not None:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close()
-            raise RuntimeError("Installation is in progress; wait before launching Fusion.") from None
-    try:
+    with installation_guard(settings):
         executable = find_executable(settings.prefix)
+        bundled_shader_compiler(executable)
         prepare_preferences(settings.prefix)
         version = fusion_version(executable)
         if version != manifest()["fusion"]["tested_version"]:
             print(f"Warning: Fusion {version} is not the tested release {manifest()['fusion']['tested_version']}.")
         settings.logs.mkdir(parents=True, exist_ok=True, mode=0o700)
         settings.logs.chmod(0o700)
-        env = settings.env()
-        with (settings.logs / "layout.log").open("a") as log:
-            subprocess.run([settings.python, ROOT / "internal/helpers/layouts.py", "--restore", executable, settings.prefix],
-                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
-        helper = None
+        env = settings.env(fusion=True)
         with (settings.logs / "fusion.log").open("a") as log:
             process = subprocess.Popen([settings.wine, executable], cwd=executable.parent, env=env,
                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
             with (settings.logs / "overlays.log").open("a") as log:
                 try:
-                    helper = subprocess.Popen([settings.python, ROOT / "internal/helpers/windows.py", "--pid", str(process.pid)],
-                                              env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                    subprocess.Popen([settings.python, ROOT / "internal/helpers/windows.py", "--pid", str(process.pid)],
+                                     env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 except OSError:
                     print("Warning: could not start the Hyprland helper. Run ./fusion.sh doctor.")
         print("Fusion started. Logs:", settings.logs)
-    finally:
-        if lock is not None:
-            lock.close()
     try:
         return process.wait()
     except KeyboardInterrupt:
@@ -310,11 +331,12 @@ def callback(settings, arguments):
         print("Expected one adskidmgr URL.", file=sys.stderr)
         return 2
     try:
-        check_runtime(settings)
-        executable = find_executable(settings.prefix, "AdskIdentityManager.exe")
-        # Do not use check=True or print exceptions containing this command's URL.
-        return subprocess.run([settings.wine, executable, arguments[0]], env=settings.env(),
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        with installation_guard(settings):
+            check_runtime(settings)
+            executable = find_executable(settings.prefix, "AdskIdentityManager.exe")
+            # Do not use check=True or print exceptions containing this command's URL.
+            return subprocess.run([settings.wine, executable, arguments[0]], env=settings.env(),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         print("Could not start Autodesk Identity Manager. Check the installation with doctor.", file=sys.stderr)
         return 1
@@ -339,14 +361,37 @@ def doctor(settings):
         executable = find_executable(settings.prefix)
         version = fusion_version(executable)
         print("Fusion:", version, "(tested: " + spec["fusion"]["tested_version"] + ")")
+        print("Bundled shader compiler:", bundled_shader_compiler(executable))
+        print("Fusion DLL overrides:", FUSION_DLL_OVERRIDES)
+        print("DXVK device filter:", os.environ.get("DXVK_FILTER_DEVICE_NAME", "automatic"))
         if version != spec["fusion"]["tested_version"]:
             print("Warning: unvalidated Fusion release.")
     except RuntimeError as error:
         problems.append(str(error))
-    result = subprocess.run([settings.python, "-c", "import Xlib; import PIL"],
+    try:
+        marker = settings.prefix / ".fusion-on-wine-prefix.json"
+        if marker.is_file():
+            version = json.loads(marker.read_text()).get("dxvk", "missing")
+            print("DXVK:", version, "(pinned: " + spec["dxvk"]["version"] + ")")
+            if version != spec["dxvk"]["version"]:
+                problems.append("DXVK differs from the pinned version. Save and close Fusion, then rerun installation "
+                                "with --upgrade-graphics.")
+        else:
+            print("Warning: legacy/manual prefix; DXVK version is unrecorded.")
+        options = list(settings.prefix.glob("drive_c/users/*/AppData/Roaming/Autodesk/Neutron Platform/Options/NMachineSpecificOptions.xml"))
+        for path in options:
+            values = {element.tag: element.get("Value") for element in ET.parse(path).getroot().iter()}
+            print("Configured viewport:", values.get("driverOptionId", "automatic"))
+            print("Configured UI:", values.get("graphicsApiOptionId", "automatic"))
+            if values.get("driverOptionId") != "VirtualDeviceDx11" or values.get("graphicsApiOptionId") != "D3D11":
+                print("Warning: graphics preferences differ from the all-DirectX defaults. "
+                      "Use --upgrade-graphics to migrate an installer-managed prefix.")
+    except (OSError, ValueError, ET.ParseError) as error:
+        problems.append("Could not read graphics configuration: " + str(error))
+    result = subprocess.run([settings.python, "-c", "import Xlib"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if result.returncode:
-        problems.append("Python Xlib/Pillow are missing. Rerun installation to prepare its private Python environment.")
+        problems.append("Python Xlib is missing. Rerun installation to prepare its private Python environment.")
     print("DISPLAY:", os.environ.get("DISPLAY", "missing"))
     if not os.environ.get("DISPLAY"):
         problems.append("No X11/XWayland display is available in this session.")
@@ -373,7 +418,8 @@ def doctor(settings):
                 print(command[0] + " timed out")
         else:
             print(command[0] + " not installed; GPU capability report skipped")
-    print("Known limitation: OpenGL sketch point/line highlighting can be missing.")
+    print("Graphics defaults: DirectX 11 viewport and UI; DXVK " + spec["dxvk"]["version"] + ".")
+    print("DXVK requires Vulkan " + spec["dxvk"]["minimum_vulkan"] + " or newer.")
     for problem in problems:
         print("ERROR:", problem)
     return bool(problems)
@@ -398,6 +444,8 @@ def main(argv=None):
     setup.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1), help="Parallel Wine build jobs, default at most 4")
     setup.add_argument("--dry-run", action="store_true", help="Print the plan without downloads or changes")
     setup.add_argument("--refresh-fusion", action="store_true", help="Run Autodesk's current downloader again")
+    setup.add_argument("--upgrade-graphics", action="store_true",
+                       help="Explicitly upgrade DXVK and select DirectX 11 in an idle, installer-managed prefix")
     sub.add_parser("doctor", help="Report versions, graphics capabilities, and missing dependencies")
     sub.add_parser("desktop", help="Regenerate desktop entries after moving this repository")
     sub.add_parser("uninstall", help="Remove desktop entries while preserving application data")

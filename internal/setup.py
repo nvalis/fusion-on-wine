@@ -13,7 +13,8 @@ import tempfile
 import time
 import urllib.request
 
-from .runtime import ROOT, active_prefix_processes, find_executable, fusion_version, install_entries, manifest, prepare_preferences
+from .runtime import (ROOT, active_prefix_processes, bundled_shader_compiler, find_executable,
+                      fusion_version, install_entries, manifest, prepare_preferences)
 
 # Host tools and verified downloads
 
@@ -148,7 +149,8 @@ def fingerprint(spec):
 def build_runtime(settings, spec, jobs):
     wanted = fingerprint(spec)
     marker = settings.runtime / RUNTIME_MARKER
-    if marker.is_file() and json.loads(marker.read_text()) == wanted and settings.wine.is_file():
+    if (marker.is_file() and json.loads(marker.read_text()) == wanted
+            and settings.wine.is_file() and settings.server.is_file()):
         print("Patched Wine runtime is already built.")
         return
     if settings.runtime.exists() and any(settings.runtime.iterdir()) and not marker.is_file():
@@ -208,7 +210,7 @@ def python_environment(settings):
 
 
 def stop_bootstrap_services(settings):
-    # Only used before Fusion is installed, never after the Autodesk downloader runs.
+    # Only used during idle-prefix preparation, never after the Autodesk downloader runs.
     subprocess.run([settings.server, "-k"], env=settings.env(), check=False)
     subprocess.run([settings.server, "-w"], env=settings.env(), check=True, timeout=60)
 
@@ -243,7 +245,7 @@ def setup_prefix(settings, spec):
     write_json(marker, {"schema": 1, "wine": spec["wine"]["version"], "bootstrap_complete": True})
 
 
-def setup_dxvk(settings, spec):
+def setup_dxvk(settings, spec, *, allow_upgrade=False):
     marker = settings.prefix / PREFIX_MARKER
     state = json.loads(marker.read_text())
     if state.get("dxvk") == spec["dxvk"]["version"]:
@@ -254,20 +256,28 @@ def setup_dxvk(settings, spec):
     except RuntimeError:
         pass
     else:
-        raise RuntimeError("DXVK changes require a fresh prefix or an explicit manual migration; existing Fusion was not altered.")
+        if not allow_upgrade:
+            raise RuntimeError("Save and close Fusion, then rerun installation with --upgrade-graphics to update DXVK. "
+                               "Existing Fusion was not altered.")
     package = download(spec["dxvk"], settings.cache / ("dxvk-" + spec["dxvk"]["version"] + ".tar.gz"))
     with tempfile.TemporaryDirectory(dir=settings.cache) as temporary:
         source = extract(package, Path(temporary), "dxvk-" + spec["dxvk"]["version"])
-        overrides = []
-        for arch, destination in (("x64", "system32"), ("x32", "syswow64")):
-            dlls = sorted((source / arch).glob("*.dll"))
-            if not dlls:
+        architectures = (("x64", "system32"), ("x32", "syswow64"))
+        packages = {arch: sorted((source / arch).glob("*.dll")) for arch, _ in architectures}
+        for arch, dlls in packages.items():
+            if not {"d3d11.dll", "dxgi.dll"}.issubset(dll.name for dll in dlls):
                 raise RuntimeError("DXVK archive is missing its " + arch + " DLLs.")
+        if active_prefix_processes(settings.prefix):
+            raise RuntimeError("This prefix started Wine applications or services during installation. "
+                               "Save and close them before updating DXVK.")
+        overrides = []
+        for arch, destination in architectures:
+            dlls = packages[arch]
             directory = settings.prefix / "drive_c/windows" / destination
             directory.mkdir(parents=True, exist_ok=True)
             for dll in dlls:
                 target = directory / dll.name
-                backup = target.with_name(target.name + ".before-dxvk")
+                backup = target.with_name(target.name + ".before-dxvk-" + state.get("dxvk", "wine"))
                 if target.exists() and not backup.exists():
                     shutil.copy2(target, backup)
                 # wineboot's DLLs can be symlinks into Wine's installation. Never overwrite their targets.
@@ -323,8 +333,11 @@ def install(settings, args):
     print("Data:", settings.home)
     print("Prefix:", settings.prefix)
     print("Wine:", settings.runtime)
-    print("Wine source and patches are pinned; Autodesk supplies the current Fusion release.")
+    print("Wine source and window fixes are pinned; Autodesk supplies the current Fusion release.")
+    print("Graphics: DirectX 11 viewport and UI, DXVK " + spec["dxvk"]["version"] + ", bundled shader compilers.")
     if args.dry_run:
+        if args.upgrade_graphics:
+            print("Existing managed prefix: explicitly upgrade DXVK and select all-DirectX graphics.")
         print("Plan: dependencies if requested; full patched WoW64 Wine build; Python environment; fresh prefix;")
         print("      Windows 11, VC++ 2022, fonts, pinned DXVK, official Fusion download, graphics defaults, desktop entries.")
         print("No downloads, system changes, or application-data changes were made.")
@@ -354,8 +367,11 @@ def install(settings, args):
         build_runtime(settings, spec, args.jobs)
         python_environment(settings)
         setup_prefix(settings, spec)
-        setup_dxvk(settings, spec)
-        install_fusion(settings, spec, args.refresh_fusion)
+        setup_dxvk(settings, spec, allow_upgrade=args.upgrade_graphics)
+        if args.upgrade_graphics:
+            prepare_preferences(settings.prefix, force_graphics=True)
+        executable = install_fusion(settings, spec, args.refresh_fusion)
+        bundled_shader_compiler(executable)
         install_entries(settings)
     print("Installation complete. Sign in yourself after running ./fusion.sh.")
     print("If Autodesk opened Fusion during installation, close it first so the graphics defaults load on restart.")
