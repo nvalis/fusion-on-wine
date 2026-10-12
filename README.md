@@ -1,0 +1,149 @@
+# Autodesk Fusion on Wine
+
+An unofficial installer and launcher for Autodesk Fusion on x86-64 Linux.
+It builds a private, patched Wine runtime and installs Fusion from Autodesk's official downloader.
+Autodesk does not support Fusion on Linux; you need your own Autodesk account and an applicable license.
+
+## Install
+
+Run from a terminal in your graphical desktop session.
+Automatic host-package installation currently supports Arch-based distributions, including CachyOS.
+
+```sh
+git clone https://github.com/nvalis/fusion-on-wine.git
+cd fusion-on-wine
+./install.sh --dry-run
+# Review applicable Autodesk, Microsoft runtime, and font licenses first.
+./install.sh --deps --accept-third-party-licenses
+./fusion.sh
+```
+
+Run as your normal user, not root.
+`--deps` uses `sudo pacman -Syu --needed` and asks you to review the package transaction.
+Omit it if dependencies are already installed.
+Allow at least 20 GB free and expect a full Wine build.
+Build parallelism defaults to at most four jobs; use `--jobs 2` on a memory-constrained machine.
+Install your GPU's appropriate drivers through your distribution first.
+
+Wine, Winetricks, DXVK, and Python versions are recorded in [internal/versions.json](internal/versions.json).
+Wine, Winetricks, and DXVK downloads have pinned SHA-256 checksums.
+Autodesk's downloader is mutable and installs the release Autodesk currently provides.
+The installer reports the detected version and warns if it differs from the tested release.
+
+<details>
+<summary>Manual dependencies for Debian/Ubuntu, not yet validated</summary>
+
+Package names and compiler availability vary by release.
+Use a recent distribution, install these dependencies yourself, then omit `--deps`.
+
+```sh
+sudo apt update
+sudo apt install build-essential gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
+  g++-mingw-w64-i686 g++-mingw-w64-x86-64 flex bison pkg-config gettext \
+  python3 python3-venv python3-pip cabextract unzip curl wget p7zip-full \
+  xdg-utils desktop-file-utils xwayland mesa-utils vulkan-tools \
+  libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
+  libxrender-dev libxcomposite-dev libxinerama-dev libxxf86vm-dev \
+  libfreetype-dev libfontconfig-dev libgnutls28-dev libgl-dev libvulkan-dev \
+  libunwind-dev libasound2-dev libpulse-dev libdbus-1-dev libcups2-dev \
+  libsdl2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libavcodec-dev libavformat-dev libswscale-dev zlib1g-dev libbz2-dev liblzma-dev
+./install.sh --accept-third-party-licenses
+```
+
+</details>
+
+## Use
+
+Launch through `./fusion.sh` or the application menu entry "Autodesk Fusion (Wine)".
+The launcher follows normal desktop tiling rules rather than forcing a floating window or fixed size.
+Sign in yourself in the browser Fusion opens, and allow it to open the `adskidmgr` link when prompted.
+The callback runs Identity Manager in the same prefix without logging the URL.
+If browser sign-in succeeds but Fusion reports failure, save any work and restart Fusion before clearing credentials.
+If Autodesk opened Fusion during installation, close it before using this launcher so the graphics defaults and helper load.
+
+```sh
+./fusion.sh doctor                  # Read-only versions, dependencies, and GPU report.
+./fusion.sh desktop                 # Regenerate entries after moving this checkout.
+./install.sh --refresh-fusion --accept-third-party-licenses
+./fusion.sh uninstall               # Remove desktop entries, preserve application data.
+./fusion.sh stop                    # Force-stop ONLY this prefix. SAVE WORK FIRST.
+```
+
+Reruns reuse matching runtime builds and completed prerequisite stages.
+The installer refuses unmanaged prefixes/runtimes and running applications in the target prefix.
+Do not launch Fusion during installation or remove a prefix to fix a build failure.
+Inspect the logs first; a runtime interrupted during replacement can leave a `.new` directory for inspection.
+A `.previous` runtime may remain after a rebuild.
+Back up your prefix before deliberate Wine or DXVK migrations.
+
+## Paths
+
+- Data, runtime, prefix, Python environment, and build/download cache: `~/.local/share/fusion-on-wine/`.
+- Logs: `~/.local/state/fusion-on-wine/logs/`.
+- Configuration: `~/.config/fusion-on-wine/config.json`.
+- Desktop entries: `~/.local/share/applications/fusion-on-wine*.desktop`.
+
+XDG base-directory overrides are respected.
+`--data-dir /absolute/path` chooses another installation directory and records it for later launches.
+For manual administration, `FUSION_WINE_HOME`, `FUSION_WINE_PREFIX`, and `FUSION_WINE_RUNTIME` override configured paths.
+A callback and its Fusion instance must use the same prefix.
+Keep the checkout accessible at its registered path, or regenerate desktop entries after moving it.
+Uninstalling preserves models, credentials, configuration, and the runtime.
+
+## What's inside
+
+```text
+install.sh                    Install entry point
+fusion.sh                     Launch and administration entry point
+internal/
+  setup.py                    Downloads, Wine build, and installation
+  runtime.py                  Configuration, launch, sign-in, and doctor
+  versions.json               Pinned versions and download checksums
+  helpers/                    Hyprland window handling and layout migration
+  patches/                    One Wine patch and one optional Hyprland patch
+  diagnostics/                Optional X11/Wine visual and window probes
+LICENSE                       Project license and retained third-party notices
+```
+
+The Wine patch keeps captionless palettes application-controlled and fixes black per-pixel-alpha areas without making the browser or selection readout opaque.
+The complete private runtime includes WoW64 support; it is not a driver mixed with another version of system Wine.
+Windows prerequisites are Windows 11 settings, VC++ 2022, and core fonts, with DXVK 2.7.1.
+The viewport defaults to OpenGL using `VirtualDeviceGLCore`.
+The Photo Booth environment is set once after account settings appear, not reset on every launch.
+Autodesk's Qt DLLs and certificate verification remain unchanged.
+
+On Hyprland, the helper repairs modal overlay opacity, stacking, palette focus, and missed palette geometry updates.
+It copies confirmed X11 geometry, refuses ambiguous window matches, and acts only on its Fusion process.
+The geometry compatibility fix requires scale-1 monitors.
+[The optional compositor patch](internal/patches/hyprland.patch) fixes Hyprland 0.56.2's missing geometry subscription when `override_redirect` changes after window creation.
+The installer does not rebuild or restart the desktop; save work in every application before applying a compositor update yourself.
+
+Optional diagnostic source is grouped under `internal/diagnostics/` and is not needed for launch.
+The ARGB probes default to centered positions and accept explicit coordinates.
+Build C probes with the private Wine SDK's `winegcc`; run generated `.exe.so` files through the private Wine binary rather than their shell wrappers.
+The window diagnostic includes input/movement commands, so do not experiment with them on unsaved working designs.
+
+## Compatibility and privacy
+
+The working configuration used CachyOS, Hyprland 0.56.2, XWayland 24.1.14, Wine 11.19, Mesa 26.2.4, an AMD Renoir GPU, and Fusion 2705.1.30.
+The patches and helper were checked there; the new clean-machine installer still needs validation on a fresh machine.
+Its source-built Wine is not a copy of that machine's distro Wine package.
+Other hardware, compositors, and Fusion releases are not claimed to behave identically.
+
+DirectX viewport experiments produced black or blank canvases, so OpenGL is the default.
+Autodesk may remove that fallback.
+Sketch points and lines can still lack visible selection highlighting; this remains unresolved.
+CAM, export, save-and-reopen, and long editing sessions have not been comprehensively verified.
+The Qt WebEngine Windows sandbox does not work here, so the launcher disables it; use trusted content and accounts.
+Private Wine does not automatically receive system Wine updates.
+
+Never publish or distribute a signed-in prefix, credentials, models, or unreviewed logs/screenshots.
+Never share OAuth callback URLs.
+This repository ships source and patches only and does not modify system Wine or `~/.wine`.
+Project code is MIT-licensed; Wine-derived changes, upstream contributions, and the Hyprland patch retain the notices collected in [LICENSE](LICENSE).
+Vendor software is downloaded separately and remains subject to its own licenses.
+
+The captionless-popup contribution comes from the [community Fusion-on-Linux project](https://codeberg.org/cryinkfly/Autodesk-Fusion-360-on-Linux).
+Other upstream projects are [Wine](https://www.winehq.org/), [Hyprland](https://github.com/hyprwm/Hyprland), [DXVK](https://github.com/doitsujin/dxvk), and [Winetricks](https://github.com/Winetricks/winetricks).
+Autodesk documents the [OpenGL sketch-highlight limitation](https://www.autodesk.com/support/technical/article/caas/sfdcarticles/sfdcarticles/Sketch-lines-are-not-highlighted-after-switching-to-the-OpenGL-setting-in-Fusion-360-Preferences.html).

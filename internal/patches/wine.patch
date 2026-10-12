@@ -1,0 +1,174 @@
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -1589,8 +1589,55 @@
+     GC                    gc;
+     struct x11drv_image  *image;
+     BOOL                  byteswap;
++    BOOL                  composited;
++    BOOL                  alpha_input_shape;
++    BOOL                  input_transparent;
++    Pixmap                input_mask;
++    struct list           input_entry;
+ };
+ 
++/* Window style changes and surface flushes run on different threads.
++ * Cache input masks separately from window data to avoid reversing the
++ * window-data / window-surface lock order. All mask requests use gdi_display. */
++static struct list input_surfaces = LIST_INIT(input_surfaces);
++static pthread_mutex_t input_surfaces_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++#ifdef HAVE_LIBXSHAPE
++static void apply_surface_input_shape( struct x11drv_window_surface *surface )
++{
++    if (surface->input_transparent)
++    {
++        static XRectangle empty_rect;
++        XShapeCombineRectangles( gdi_display, surface->window, ShapeInput, 0, 0,
++                                 &empty_rect, 1, ShapeSet, YXBanded );
++    }
++    else
++        XShapeCombineMask( gdi_display, surface->window, ShapeInput, 0, 0,
++                           surface->alpha_input_shape ? surface->input_mask : None, ShapeSet );
++}
++#endif
++
++BOOL sync_surface_input_shape( Window window, BOOL transparent )
++{
++#ifdef HAVE_LIBXSHAPE
++    struct x11drv_window_surface *surface;
++    BOOL found = FALSE;
++
++    pthread_mutex_lock( &input_surfaces_mutex );
++    LIST_FOR_EACH_ENTRY( surface, &input_surfaces, struct x11drv_window_surface, input_entry )
++    {
++        if (surface->window != window) continue;
++        surface->input_transparent = transparent;
++        if (!found) apply_surface_input_shape( surface );
++        found = TRUE;
++    }
++    if (found) XFlush( gdi_display );
++    pthread_mutex_unlock( &input_surfaces_mutex );
++    return found;
++#endif
++    return FALSE;
++}
++
+ static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
+ {
+     return (struct x11drv_window_surface *)surface;
+@@ -1829,24 +1876,39 @@
+                 ptr[x] |= alpha_bits;
+     }
+ 
+-    if (shape_changed)
+-    {
+ #ifdef HAVE_LIBXSHAPE
+-        if (!shape_bits)
+-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, None, ShapeSet );
+-        else
++    {
++        BOOL input_shape = surface->composited && alpha_mask &&
++                           window_surface->color_key == CLR_INVALID && !window_surface->shape_region;
++
++        if (shape_changed || input_shape != surface->alpha_input_shape)
+         {
+-            struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
+-            XVisualInfo vis = default_visual;
+-            Pixmap shape;
+-
+-            vis.depth = 1;
+-            shape = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
+-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, shape, ShapeSet );
+-            XFreePixmap( gdi_display, shape );
++            Pixmap mask = None;
++
++            if (shape_bits)
++            {
++                struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
++                XVisualInfo vis = default_visual;
++
++                vis.depth = 1;
++                mask = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
++            }
++
++            /* ARGB already describes visibility. Bounding holes render black
++             * under XWayland, so use this mask only for hit testing. Keep
++             * bounding masks for explicit regions and color-key windows. */
++            pthread_mutex_lock( &input_surfaces_mutex );
++            if (surface->input_mask) XFreePixmap( gdi_display, surface->input_mask );
++            surface->alpha_input_shape = input_shape;
++            surface->input_mask = input_shape ? mask : None;
++            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0,
++                               input_shape ? None : mask, ShapeSet );
++            apply_surface_input_shape( surface );
++            if (!input_shape && mask) XFreePixmap( gdi_display, mask );
++            pthread_mutex_unlock( &input_surfaces_mutex );
+         }
+-#endif /* HAVE_LIBXSHAPE */
+     }
++#endif /* HAVE_LIBXSHAPE */
+ 
+     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
+         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
+@@ -1866,6 +1928,10 @@
+     struct x11drv_window_surface *surface = get_x11_surface( window_surface );
+ 
+     TRACE( "freeing %p\n", surface );
++    pthread_mutex_lock( &input_surfaces_mutex );
++    list_remove( &surface->input_entry );
++    if (surface->input_mask) XFreePixmap( gdi_display, surface->input_mask );
++    pthread_mutex_unlock( &input_surfaces_mutex );
+     if (surface->gc) XFreeGC( gdi_display, surface->gc );
+     if (surface->image) x11drv_image_destroy( surface->image );
+ }
+@@ -1940,12 +2006,21 @@
+     }
+     else
+     {
++        char selection[64];
++
+         surface = get_x11_surface( window_surface );
+         surface->image = image;
+         surface->byteswap = byteswap;
+         surface->window = window;
++        surface->input_transparent = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT;
++        snprintf( selection, sizeof(selection), "_NET_WM_CM_S%d", DefaultScreen( gdi_display ) );
++        surface->composited = vis->depth == 32 &&
++                              XGetSelectionOwner( gdi_display, XInternAtom( gdi_display, selection, False ) ) != None;
+         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
+         XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
++        pthread_mutex_lock( &input_surfaces_mutex );
++        list_add_head( &input_surfaces, &surface->input_entry );
++        pthread_mutex_unlock( &input_surfaces_mutex );
+     }
+ 
+     return window_surface;
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -444,6 +444,8 @@
+     /* child windows are not managed */
+     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
++    /* Fusion's captionless palettes must remain application-managed. */
++    if ((style & (WS_POPUP|WS_CAPTION)) == WS_POPUP) return FALSE;
+     /* activated windows are managed */
+     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+     if (hwnd == get_active_window()) return TRUE;
+@@ -549,6 +551,7 @@
+     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
+ 
+     if (!data->whole_window) return;
++    if (sync_surface_input_shape( data->whole_window, !!(ex_style & WS_EX_TRANSPARENT) )) return;
+ 
+     if (ex_style & WS_EX_TRANSPARENT)
+     {
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -328,6 +328,7 @@
+ extern int X11DRV_PALETTE_ToPhysical(X11DRV_PDEVICE *physDev, COLORREF color);
+ extern COLORREF X11DRV_PALETTE_GetColor( X11DRV_PDEVICE *physDev, COLORREF color );
+ extern int *get_window_surface_mapping( int bpp, int *mapping );
++extern BOOL sync_surface_input_shape( Window window, BOOL transparent );
+ 
+ static inline const char *debugstr_color( COLORREF color )
+ {

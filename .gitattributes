@@ -1,0 +1,4 @@
+# Blank context lines in unified patches contain a required leading space.
+internal/patches/*.patch -whitespace
+# Preserve upstream license texts verbatim.
+LICENSE -whitespace

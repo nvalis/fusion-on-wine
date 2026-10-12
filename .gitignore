@@ -1,0 +1,17 @@
+# Private application state, credentials, models, downloads, and build outputs.
+/logs/
+/backups/
+/downloads/
+/wine-build/
+/wine-runner/
+/fusion-linux-reference/
+/fusion-linux-current/
+/vulkan-info.txt
+/tests/
+/config.json
+/.venv/
+__pycache__/
+*.pyc
+*.o
+*.so
+/tools/*.exe
