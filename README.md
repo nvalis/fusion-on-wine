@@ -117,7 +117,7 @@ internal/
   runtime.py                  Configuration, launch, sign-in, and doctor
   versions.json               Pinned versions and download checksums
   helpers/                    Hyprland window handling
-  patches/                    One Wine patch and one optional Hyprland patch
+  patches/                    Wine window fixes
 LICENSE                       Project license and retained third-party notices
 ```
 
@@ -134,8 +134,6 @@ Autodesk's Qt DLLs and certificate verification remain unchanged.
 On Hyprland, the helper repairs modal overlay opacity, stacking, palette focus, and missed palette geometry updates.
 It copies confirmed X11 geometry, refuses ambiguous window matches, and acts only on its Fusion process.
 The geometry compatibility fix requires scale-1 monitors.
-[The optional compositor patch](internal/patches/hyprland.patch) fixes Hyprland 0.56.2's missing geometry subscription when `override_redirect` changes after window creation.
-The installer does not rebuild or restart the desktop; save work in every application before applying a compositor update yourself.
 
 ## Compatibility and privacy
 
@@ -157,7 +155,7 @@ Private Wine does not automatically receive system Wine updates.
 Never publish or distribute a signed-in prefix, credentials, models, or unreviewed logs/screenshots.
 Never share OAuth callback URLs.
 This repository ships source and patches only and does not modify system Wine or `~/.wine`.
-Project code is MIT-licensed; Wine-derived changes, upstream contributions, and the Hyprland patch retain the notices collected in [LICENSE](LICENSE).
+Project code is MIT-licensed; Wine-derived changes and upstream contributions retain the notices collected in [LICENSE](LICENSE).
 Vendor software is downloaded separately and remains subject to its own licenses.
 
 The captionless-popup contribution comes from the [community Fusion-on-Linux project](https://codeberg.org/cryinkfly/Autodesk-Fusion-360-on-Linux).

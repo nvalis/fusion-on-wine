@@ -402,7 +402,7 @@ def doctor(settings):
             monitors = subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, text=True)
             try:
                 if any(m["scale"] != 1 for m in json.loads(monitors.stdout)):
-                    print("Warning: palette geometry compatibility fix is disabled on scaled monitors; use the compositor patch.")
+                    print("Warning: palette geometry compatibility fix is disabled on scaled monitors.")
             except (ValueError, KeyError, TypeError):
                 problems.append("Could not query Hyprland monitors.")
         else:
