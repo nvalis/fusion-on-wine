@@ -7,7 +7,6 @@
 /fusion-linux-reference/
 /fusion-linux-current/
 /vulkan-info.txt
-/tests/
 /config.json
 /.venv/
 __pycache__/

@@ -56,7 +56,12 @@ class Settings:
         # Never let a caller's system-Wine overrides mix libraries with this runtime.
         env.pop("WINEDLLPATH", None)
         env.pop("WINELOADER", None)
+        env.pop("WINEBOOTSTRAPMODE", None)
         env.pop("WINEDLLOVERRIDES", None)
+        env.pop("FUSION_WINE_MANAGED_PALETTES", None)
+        env.pop("FUSION_WINE_EMBED_PALETTES", None)
+        if fusion and env.get("SWAYSOCK"):
+            env["FUSION_WINE_EMBED_PALETTES"] = "1"
         if fusion:
             # Fusion ships its own compilers. Wine's compiler breaks OGS shading and redraws.
             env["WINEDLLOVERRIDES"] = FUSION_DLL_OVERRIDES
@@ -290,7 +295,7 @@ def launch(settings):
     check_runtime(settings)
     if not os.environ.get("DISPLAY"):
         raise RuntimeError("No X11/XWayland display is available. Launch from your graphical desktop.")
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and not os.environ.get("SWAYSOCK"):
         if shutil.which("hyprctl") is None:
             raise RuntimeError("Hyprland's hyprctl is missing.")
         if subprocess.run([settings.python, "-c", "import Xlib"], stdout=subprocess.DEVNULL,
@@ -310,7 +315,7 @@ def launch(settings):
         with (settings.logs / "fusion.log").open("a") as log:
             process = subprocess.Popen([settings.wine, executable], cwd=executable.parent, env=env,
                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        if env.get("HYPRLAND_INSTANCE_SIGNATURE") and not env.get("SWAYSOCK"):
             with (settings.logs / "overlays.log").open("a") as log:
                 try:
                     subprocess.Popen([settings.python, ROOT / "internal/helpers/windows.py", "--pid", str(process.pid)],
@@ -407,6 +412,8 @@ def doctor(settings):
                 problems.append("Could not query Hyprland monitors.")
         else:
             problems.append("Hyprland session detected but hyprctl is missing.")
+    elif os.environ.get("SWAYSOCK"):
+        print("Sway: Wine contains palettes inside their owner; no placement helper or virtual desktop.")
     else:
         print("Warning: this compositor is not part of the validated setup; Hyprland fixes will not run.")
     for command in (["glxinfo", "-B"], ["vulkaninfo", "--summary"]):

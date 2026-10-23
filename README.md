@@ -59,6 +59,16 @@ sudo apt install build-essential gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
 
 Launch through `./fusion.sh` or the application menu entry "Autodesk Fusion (Wine)".
 The launcher follows normal desktop tiling rules rather than forcing a floating window or fixed size.
+On Sway, Wine contains Fusion's owned captionless `Fusion360` and `HUD:` palette surfaces inside their main X11 owner window.
+Fusion still sees Windows popups and controls their placement and stacking; Sway no longer treats them as separate floating dialogs.
+This uses neither a Wine virtual desktop nor a Sway placement helper or global window rules.
+Palettes follow their owner across workspaces and are clipped to its bounds: they cannot extend outside the main window or onto a second monitor independently.
+Ordinary titled dialogs, menus, and tooltips retain the existing handling; owned `Fusion360` modal overlay surfaces are contained too.
+After updating the Wine patches, save and close Fusion and its Wine services, then rerun `./install.sh --accept-third-party-licenses` to rebuild the runtime.
+The isolated integration fixture in `tests/wine_palettes.c` checks containment, movement, resizing, remapping, keyboard input, alpha-transparent holes, palette persistence during repeated parent repaints without hover, and owner destruction using `tests/check_wine_palettes.py` and a separate test prefix.
+The checker's `--gpu` mode also exercises offscreen OpenGL presents and verifies that clicking the owner does not erase the palettes. Collapse/expand checks stop periodic parent/GPU redraws and use a deliberately different software backing colour to catch stale backgrounds revealed while idle.
+Contained ARGB palettes use alpha-derived bounding masks rather than top-level compositor blending. A 50% alpha cutoff omits faint edges/shadows instead of turning their premultiplied pixels into black borders; opaque black UI is preserved. Masks refresh on opacity-only updates too; actual mask changes queue an owner/child application repaint so collapsing rows does not expose stale black software backing pixels beneath an idle GPU frame. Unchanged masks do not queue more repaints. This is binary transparency, not full fractional-alpha blending; translucent modal rendering still needs validation. Software repaints and offscreen GPU frame copies clip child windows, including the XRender destination path.
+Real Fusion dragging, modal workflows, and rendering still need interactive validation.
 Sign in yourself in the browser Fusion opens, and allow it to open the `adskidmgr` link when prompted.
 The callback runs Identity Manager in the same prefix without logging the URL.
 If browser sign-in succeeds but Fusion reports failure, save any work and restart Fusion before clearing credentials.
