@@ -1,0 +1,424 @@
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -1593,6 +1593,8 @@
+     BOOL                  alpha_input_shape;
+     BOOL                  input_transparent;
+     Pixmap                input_mask;
++    BYTE                 *palette_shape_bits;
++    UINT                  palette_shape_size;
+     struct list           input_entry;
+ };
+ 
+@@ -1832,6 +1834,53 @@
+     }
+ }
+ 
++#ifdef HAVE_LIBXSHAPE
++/* A contained child has binary visibility, not compositor alpha blending.
++ * Do not promote faint premultiplied edge/shadow pixels to opaque black.
++ * Intersect the original mask so explicit regions and colour keys still win. */
++static Pixmap create_palette_shape_mask( struct x11drv_window_surface *surface, BOOL *changed,
++                                         const BITMAPINFO *shape_info, const void *shape_bits,
++                                         const BITMAPINFO *color_info, const void *color_bits )
++{
++    const BITMAPINFOHEADER *shape = &shape_info->bmiHeader, *color = &color_info->bmiHeader;
++    unsigned int height = abs( color->biHeight ), shape_height = abs( shape->biHeight );
++    unsigned int color_stride = color->biSizeImage / height;
++    unsigned int shape_stride = shape->biSizeImage / shape_height;
++    unsigned int x, y, width = min( color->biWidth, shape->biWidth );
++    struct gdi_image_bits bits = {0};
++    XVisualInfo vis = default_visual;
++    BYTE *mask;
++    Pixmap result;
++
++    if (!(mask = malloc( shape->biSizeImage ))) return None;
++    memcpy( mask, shape_bits, shape->biSizeImage );
++    for (y = 0; y < min( height, shape_height ); y++)
++    {
++        unsigned int color_y = color->biHeight < 0 ? y : height - 1 - y;
++        unsigned int shape_y = shape->biHeight < 0 ? y : shape_height - 1 - y;
++        const UINT32 *pixels = (const UINT32 *)((const BYTE *)color_bits + color_y * color_stride);
++        BYTE *row = mask + shape_y * shape_stride;
++
++        for (x = 0; x < width; x++)
++            if (!(pixels[x] & 0x80000000)) row[x / 8] &= ~(0x80 >> (x % 8));
++    }
++    bits.ptr = mask;
++    vis.depth = 1;
++    result = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
++    if (result && (surface->palette_shape_size != shape->biSizeImage ||
++                   memcmp( surface->palette_shape_bits, mask, shape->biSizeImage )))
++    {
++        *changed = TRUE;
++        free( surface->palette_shape_bits );
++        surface->palette_shape_bits = mask;
++        surface->palette_shape_size = shape->biSizeImage;
++        mask = NULL;
++    }
++    free( mask );
++    return result;
++}
++#endif
++
+ /***********************************************************************
+  *           x11drv_surface_flush
+  */
+@@ -1881,9 +1930,15 @@
+         BOOL input_shape = surface->composited && alpha_mask &&
+                            window_surface->color_key == CLR_INVALID && !window_surface->shape_region;
+ 
+-        if (shape_changed || input_shape != surface->alpha_input_shape)
++        BOOL palette_shape = alpha_mask == 0xff000000 && color_info->bmiHeader.biBitCount == 32 &&
++                             get_fusion_palette_parent( window_surface->hwnd );
++
++        /* Alpha can cross the binary cutoff without changing Wine's nonzero-
++         * alpha shape, so refresh this mask on colour-only updates too. */
++        if (shape_changed || input_shape != surface->alpha_input_shape || palette_shape)
+         {
+             Pixmap mask = None;
++            BOOL palette_changed = FALSE;
+ 
+             if (shape_bits)
+             {
+@@ -1891,12 +1946,16 @@
+                 XVisualInfo vis = default_visual;
+ 
+                 vis.depth = 1;
+-                mask = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
++                if (palette_shape)
++                    mask = create_palette_shape_mask( surface, &palette_changed, shape_info, shape_bits,
++                                                       color_info, color_bits );
++                else mask = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
+             }
+ 
+-            /* ARGB already describes visibility. Bounding holes render black
+-             * under XWayland, so use this mask only for hit testing. Keep
+-             * bounding masks for explicit regions and color-key windows. */
++            /* Composited toplevel ARGB already describes visibility. Bounding
++             * holes render black there under XWayland, so use input masks.
++             * Contained children need bounding masks: their alpha is not
++             * composited separately from the opaque owner surface. */
+             pthread_mutex_lock( &input_surfaces_mutex );
+             if (surface->input_mask) XFreePixmap( gdi_display, surface->input_mask );
+             surface->alpha_input_shape = input_shape;
+@@ -1906,6 +1965,19 @@
+             apply_surface_input_shape( surface );
+             if (!input_shape && mask) XFreePixmap( gdi_display, mask );
+             pthread_mutex_unlock( &input_surfaces_mutex );
++
++            if (palette_changed)
++            {
++                HWND owner = NtUserGetAncestor( window_surface->hwnd, GA_ROOTOWNER );
++
++                /* X11 shape changes need not expose the owner, and its cached
++                 * GDI surface can be stale under offscreen GPU content. Queue
++                 * an application paint of the owner AND its children. Use the
++                 * whole owner because Win32 may clip a small invalid rectangle
++                 * hidden beneath what it still sees as a top-level popup.
++                 * Do not use UPDATENOW while holding this surface's mutex. */
++                NtUserRedrawWindow( owner, NULL, 0, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN );
++            }
+         }
+     }
+ #endif /* HAVE_LIBXSHAPE */
+@@ -1932,6 +2004,7 @@
+     list_remove( &surface->input_entry );
+     if (surface->input_mask) XFreePixmap( gdi_display, surface->input_mask );
+     pthread_mutex_unlock( &input_surfaces_mutex );
++    free( surface->palette_shape_bits );
+     if (surface->gc) XFreeGC( gdi_display, surface->gc );
+     if (surface->image) x11drv_image_destroy( surface->image );
+ }
+@@ -2014,10 +2087,16 @@
+         surface->window = window;
+         surface->input_transparent = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT;
+         snprintf( selection, sizeof(selection), "_NET_WM_CM_S%d", DefaultScreen( gdi_display ) );
+-        surface->composited = vis->depth == 32 &&
++        /* XWayland composites toplevel ARGB surfaces, not ARGB children inside
++         * an opaque owner. Contained palettes need alpha-derived bounding holes. */
++        surface->composited = vis->depth == 32 && !get_fusion_palette_parent( hwnd ) &&
+                               XGetSelectionOwner( gdi_display, XInternAtom( gdi_display, selection, False ) ) != None;
+         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
+-        XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
++        /* Repainting the owner must not overwrite its contained palette pixels. */
++        XSetSubwindowMode( gdi_display, surface->gc,
++                           getenv( "FUSION_WINE_EMBED_PALETTES" ) &&
++                           NtUserGetAncestor( hwnd, GA_ROOT ) == hwnd &&
++                           !NtUserGetWindowRelative( hwnd, GW_OWNER ) ? ClipByChildren : IncludeInferiors );
+         pthread_mutex_lock( &input_surfaces_mutex );
+         list_add_head( &input_surfaces, &surface->input_entry );
+         pthread_mutex_unlock( &input_surfaces_mutex );
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -164,8 +164,10 @@
+     if (!ref)
+     {
+         struct x11drv_thread_data *data = x11drv_thread_data();
+-
+-        if (!win->destroyed) XSelectInput( data->display, win->window, 0 );
++        XPointer hwnd;
++
++        if (!win->destroyed && XFindContext( data->display, win->window, winContext, &hwnd ))
++            XSelectInput( data->display, win->window, 0 );
+         XDeleteContext( data->display, win->window, host_window_context );
+         if (win->parent) host_window_release( win->parent );
+         free( win->children );
+@@ -214,8 +216,9 @@
+     win->window = window;
+ 
+     X11DRV_expect_error( data->display, host_window_error, NULL );
+-    XSelectInput( data->display, window, StructureNotifyMask );
+     if (!XGetWindowAttributes( data->display, window, &attr )) memset( &attr, 0, sizeof(attr) );
++    /* A Fusion palette's host is a Wine window, not a foreign WM frame. */
++    XSelectInput( data->display, window, attr.your_event_mask | StructureNotifyMask );
+     if (!XQueryTree( data->display, window, &xroot, &xparent, &xchildren, &nchildren )) xparent = root_window;
+     else XFree( xchildren );
+     if (X11DRV_check_error()) WARN( "window %lx already destroyed\n", window );
+@@ -1405,6 +1408,49 @@
+     }
+ }
+ 
++/* Keep Win32 popups, but make their X11 surfaces children of the owner. This
++ * leaves placement/stacking with the application while the compositor sees one
++ * toplevel. Do not use the XEMBED path: it deliberately suppresses movement. */
++Window get_fusion_palette_parent( HWND hwnd )
++{
++    static const WCHAR palette_title[] = {'F','u','s','i','o','n','3','6','0',0};
++    static const WCHAR hud_prefix[] = {'H','U','D',':',0};
++    DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE ), pid;
++    WCHAR title[128];
++    HWND owner;
++
++    if (!getenv( "FUSION_WINE_EMBED_PALETTES" )) return 0;
++    if ((style & (WS_CHILD | WS_POPUP | WS_CAPTION)) != WS_POPUP) return 0;
++    if (!NtUserInternalGetWindowText( hwnd, title, ARRAY_SIZE(title) )) return 0;
++    if (wcscmp( title, palette_title ) && wcsncmp( title, hud_prefix, 4 )) return 0;
++    if (!(owner = NtUserGetWindowRelative( hwnd, GW_OWNER ))) return 0;
++    owner = NtUserGetAncestor( owner, GA_ROOTOWNER );
++    if (!owner || owner == hwnd || owner == NtUserGetDesktopWindow()) return 0;
++    NtUserGetWindowThread( owner, &pid );
++    if (pid != GetCurrentProcessId()) return 0;
++    return (Window)NtUserGetProp( owner, whole_window_prop );
++}
++
++static void sync_palette_parent( struct x11drv_win_data *data )
++{
++    Window parent = get_fusion_palette_parent( data->hwnd ), child;
++    RECT rect;
++    int x, y;
++
++    if (!data->whole_window || parent == data->palette_parent) return;
++    if (!XTranslateCoordinates( data->display, data->whole_window, parent ? parent : root_window,
++                                0, 0, &x, &y, &child )) return;
++    XReparentWindow( data->display, data->whole_window, parent ? parent : root_window, x, y );
++    data->palette_parent = parent;
++    set_window_parent( data, parent ? parent : root_window );
++    if (data->parent)
++    {
++        rect = data->rects.visible;
++        OffsetRect( &rect, x - rect.left, y - rect.top );
++        host_window_configure_child( data->parent, data->whole_window, rect, FALSE );
++    }
++}
++
+ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL above )
+ {
+     const RECT *old_rect = &data->pending_state.rect;
+@@ -1412,6 +1458,8 @@
+     XWindowChanges changes;
+     RECT *new_rect = &rect;
+     UINT mask = 0;
++
++    sync_palette_parent( data );
+ 
+     /* only the size is allowed to change for the desktop window or systray docked windows */
+     if (data->whole_window == root_window || data->embedded)
+@@ -1452,6 +1500,12 @@
+         POINT pt = virtual_screen_to_root( new_rect->left, new_rect->top );
+         changes.x = pt.x;
+         changes.y = pt.y;
++        if (data->palette_parent)
++        {
++            Window child;
++            if (!XTranslateCoordinates( data->display, root_window, data->palette_parent,
++                                        pt.x, pt.y, &changes.x, &changes.y, &child )) return;
++        }
+         mask |= CWX | CWY;
+     }
+     else
+@@ -1470,7 +1524,8 @@
+     data->configure_serial = NextRequest( data->display );
+     TRACE( "window %p/%lx, requesting config %s mask %#x above %u, serial %lu\n", data->hwnd, data->whole_window,
+            wine_dbgstr_rect(new_rect), mask, above, data->configure_serial );
+-    XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
++    if (data->palette_parent) XConfigureWindow( data->display, data->whole_window, mask, &changes );
++    else XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
+ }
+ 
+ /***********************************************************************
+@@ -1747,7 +1802,8 @@
+     long old_monitors[4], monitors[4];
+     UINT flags;
+ 
+-    if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
++    /* Owner motion changes a contained palette's screen coordinates too. */
++    if (!data->managed && !data->palette_parent) return 0;
+     if (is_virtual_desktop()) return 0; /* ignore window manager config changes in virtual desktop mode */
+     if (data->desired_state.wm_state != NormalState) return 0; /* ignore config changes on invisible/minimized windows */
+ 
+@@ -2165,6 +2221,19 @@
+     update_net_wm_states( data );
+ 
+     new_rect = data->rects.visible;
++    if (data->palette_parent && (swp_flags & SWP_NOMOVE))
++    {
++        Window child;
++        POINT pt;
++        /* Owner state changes also send NOMOVE updates to owned popups. Their
++         * old screen coordinates must not undo the X11 parent's motion. */
++        if (XTranslateCoordinates( data->display, data->whole_window, root_window,
++                                   0, 0, &pt.x, &pt.y, &child ))
++        {
++            pt = root_to_virtual_screen( pt.x, pt.y );
++            OffsetRect( &new_rect, pt.x - new_rect.left, pt.y - new_rect.top );
++        }
++    }
+ 
+     /* if the window has been moved offscreen by the window manager, we didn't tell the Win32 side about it */
+     window_rect = window_rect_from_visible( old_rects, data->desired_state.rect );
+@@ -2428,7 +2497,8 @@
+     BYTE alpha;
+     DWORD layered_flags;
+     HRGN win_rgn;
+-    POINT pos;
++    POINT pos, local_pos;
++    Window child;
+ 
+     if ((win_rgn = NtGdiCreateRectRgn( 0, 0, 0, 0 )) &&
+         NtUserGetWindowRgnEx( data->hwnd, win_rgn, 0 ) == ERROR)
+@@ -2450,14 +2520,28 @@
+     if (!(cy = data->rects.visible.bottom - data->rects.visible.top)) cy = 1;
+     else if (cy > 65535) cy = 65535;
+ 
+-    pos = virtual_screen_to_root( data->rects.visible.left, data->rects.visible.top );
+-    data->whole_window = XCreateWindow( data->display, root_window, pos.x, pos.y,
++    pos = local_pos = virtual_screen_to_root( data->rects.visible.left, data->rects.visible.top );
++    data->palette_parent = get_fusion_palette_parent( data->hwnd );
++    if (data->palette_parent && !XTranslateCoordinates( data->display, root_window, data->palette_parent,
++                                                       pos.x, pos.y, &local_pos.x, &local_pos.y, &child ))
++    {
++        data->palette_parent = 0;
++        local_pos = pos;
++    }
++    data->whole_window = XCreateWindow( data->display, data->palette_parent ? data->palette_parent : root_window,
++                                        local_pos.x, local_pos.y,
+                                         cx, cy, 0, data->vis.depth, InputOutput,
+                                         data->vis.visual, mask, &attr );
+     if (!data->whole_window) goto done;
+     SetRect( &data->current_state.rect, pos.x, pos.y, pos.x + cx, pos.y + cy );
+     data->pending_state.rect = data->current_state.rect;
+     data->desired_state.rect = data->current_state.rect;
++    if (data->palette_parent)
++    {
++        RECT rect = {local_pos.x, local_pos.y, local_pos.x + cx, local_pos.y + cy};
++        set_window_parent( data, data->palette_parent );
++        if (data->parent) host_window_configure_child( data->parent, data->whole_window, rect, FALSE );
++    }
+ 
+     x11drv_xinput2_enable( data->display, data->whole_window );
+     set_initial_wm_hints( data->display, data->whole_window );
+@@ -2525,6 +2609,7 @@
+     data->configure_serial = 0;
+     data->net_wm_icon_serial = 0;
+     data->reparenting = 0;
++    data->palette_parent = 0;
+ 
+     if (data->xic)
+     {
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -195,6 +195,7 @@
+ static BOOL host_window_filter_event( XEvent *event )
+ {
+     struct host_window *win;
++    XPointer hwnd;
+ 
+     if (!(win = get_host_window( event->xany.window, FALSE ))) return FALSE;
+ 
+@@ -232,7 +233,8 @@
+     }
+     }
+ 
+-    return TRUE;
++    /* Owned palette hosts still need their ordinary Wine input/state events. */
++    return XFindContext( event->xany.display, win->window, winContext, &hwnd ) != 0;
+ }
+ 
+ /***********************************************************************
+@@ -1022,7 +1024,7 @@
+     /* only handle GravityNotify events, that we generate ourselves, for embedded windows,
+      * top-level windows will receive the WM synthetic ConfigureNotify events instead.
+      */
+-    if (data->embedded)
++    if (data->embedded || data->palette_parent)
+     {
+         /* synthetic events are already in absolute coordinates */
+         if (!event->send_event) pos = host_window_map_point( data->parent, event->x, event->y );
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -329,6 +329,7 @@
+ extern COLORREF X11DRV_PALETTE_GetColor( X11DRV_PDEVICE *physDev, COLORREF color );
+ extern int *get_window_surface_mapping( int bpp, int *mapping );
+ extern BOOL sync_surface_input_shape( Window window, BOOL transparent );
++extern Window get_fusion_palette_parent( HWND hwnd );
+ 
+ static inline const char *debugstr_color( COLORREF color )
+ {
+@@ -681,6 +682,7 @@
+     HWND        hwnd;           /* hwnd that this private data belongs to */
+     Window      whole_window;   /* X window for the complete window */
+     Window      client_window;  /* X window for the client area */
++    Window      palette_parent; /* Fusion owner surface, without changing Win32 ownership */
+     struct window_rects rects;  /* window rects in monitor DPI, relative to parent client area */
+     struct host_window *parent; /* the host window parent, frame or embedder, NULL if root_window */
+     XIC         xic;            /* X input context */
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -25,6 +25,7 @@
+ #include "config.h"
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
+ 
+@@ -398,7 +399,11 @@
+            toplevel, wine_dbgstr_rect(&rect_dst), region );
+ 
+     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+-        set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
++        /* Offscreen GPU presents must preserve contained palette siblings,
++         * just like software window-surface flushes do. */
++        set_dc_drawable( surface->hdc_dst, window, &rect_dst,
++                         getenv( "FUSION_WINE_EMBED_PALETTES" ) &&
++                         !NtUserGetWindowRelative( toplevel, GW_OWNER ) ? ClipByChildren : IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+ 
+     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+--- a/dlls/winex11.drv/xrender.c
++++ b/dlls/winex11.drv/xrender.c
+@@ -485,8 +485,12 @@
+     if (!dev->pict && dev->pict_format)
+     {
+         XRenderPictureAttributes pa;
+-
+-        pa.subwindow_mode = IncludeInferiors;
++        XGCValues values;
++
++        /* Respect SET_DRAWABLE's clipping mode for the destination. Otherwise
++         * accelerated blits erase children even when the GC clips them. */
++        pa.subwindow_mode = XGetGCValues( gdi_display, dev->x11dev->gc, GCSubwindowMode, &values )
++                            ? values.subwindow_mode : IncludeInferiors;
+         dev->pict = pXRenderCreatePicture( gdi_display, dev->x11dev->drawable,
+                                            dev->pict_format, CPSubwindowMode, &pa );
+         TRACE( "Allocing pict=%lx dc=%p drawable=%08lx\n",

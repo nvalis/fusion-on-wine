@@ -234,7 +234,24 @@ def setup_prefix(settings, spec):
     # Write ownership before wineboot so a failed bootstrap can be retried safely.
     if not marker.exists():
         write_json(marker, {"schema": 1, "wine": spec["wine"]["version"]})
-    run([settings.wine, "wineboot.exe", "-u"], env=settings.env(), log=settings.logs / "prefix.log")
+    # Wine 11 only loads missing builtin files in bootstrap mode. The ownership
+    # marker makes this directory nonempty before Wine sees it, and an interrupted
+    # first boot can also leave an incomplete prefix. Plain wineboot -u may then
+    # return success without populating syswow64 (or loading kernel32.dll).
+    env = settings.env()
+    env["WINEBOOTSTRAPMODE"] = "1"
+    run([settings.wine, "wineboot.exe", "-u"], env=env, log=settings.logs / "prefix.log")
+    stop_bootstrap_services(settings)
+    # Test outside bootstrap mode: wineboot's exit status does not reflect all
+    # child installation failures. Do not mark a broken prefix complete.
+    for directory in ("system32", "syswow64"):
+        names = ("kernel32.dll", "reg.exe", "regedit.exe") if directory == "syswow64" else ("kernel32.dll", "reg.exe")
+        for name in names:
+            if not (settings.prefix / "drive_c/windows" / directory / name).is_file():
+                raise RuntimeError(f"Wine bootstrap did not install {directory}/{name}. "
+                                   f"See {settings.logs / 'prefix.log'}.")
+        run([settings.wine, rf"C:\windows\{directory}\reg.exe", "query", r"HKLM\Software\Microsoft\Windows NT\CurrentVersion"],
+            env=settings.env(), log=settings.logs / "prefix.log")
     stop_bootstrap_services(settings)
     tricks = download(spec["winetricks"], settings.cache / ("winetricks-" + spec["winetricks"]["version"]))
     env = settings.env()
