@@ -103,6 +103,48 @@ The installer backs up replaced DLLs and the original graphics preferences.
 Ordinary launches preserve existing graphics preferences; they do not silently migrate an installation.
 Unmanaged prefixes still require a separate, deliberate migration and are not modified by this command.
 
+## Delayed hover highlighting (NVIDIA/XWayland)
+
+`internal/patches/wine-present.patch` fixes a confirmed one-frame-behind viewport
+copy on an RTX 2060 with NVIDIA 615.78.08, Sway/XWayland, and Fusion 2705.1.30.
+Fusion's offscreen drawable already contained the correct highlight, while the
+visible owner matched the previous frame even after two seconds without input.
+Reducing DXVK frame latency, waiting for Vulkan presentation, and `XSync` alone
+were insufficient. Reading one pixel of the source drawable before Wine's GDI
+copy fixed highlighting in the interactive Fusion test.
+
+The Fusion launcher enables `FUSION_WINE_SYNC_PRESENT=1`. The patch retains the
+bounded Vulkan present-ID wait (when available), performs the X11 round trip
+and one-pixel readback, then uses the existing copy and palette clipping.
+This is a synchronous compatibility workaround with potential GPU-stall overhead,
+not a general performance improvement. Installers and sign-in callbacks do not
+inherit it. For comparison, launch with `FUSION_WINE_SYNC_PRESENT=0 ./fusion.sh`.
+No mouse-event injection, periodic redraw helper, or Fusion DLL modification is used.
+
+Existing installations need a Wine rebuild: save and close Fusion, stop remaining
+prefix services with `./fusion.sh stop`, then run
+`./install.sh --accept-third-party-licenses`. Patch hashes participate in the
+runtime fingerprint, so an older runtime cannot silently pass the launch check.
+`./fusion.sh doctor` reports whether synchronization is enabled.
+
+Run non-graphical tests with `python -m unittest discover -s tests`.
+For an opt-in graphical regression check, compile `tests/present_latency.cpp`
+(the build command is in its header), put DXVK's x64 `d3d11.dll` and `dxgi.dll`
+beside the executable, and run:
+
+```sh
+~/.local/share/fusion-on-wine/python/bin/python tests/check_present_latency.py \
+  --runtime ~/.local/share/fusion-on-wine/runtime/wine-11.19 \
+  --prefix /absolute/path/to/isolated-test-prefix \
+  --exe /absolute/path/to/present_latency.exe
+```
+
+The checker briefly focuses its own window and verifies six single-present
+colours in the visible X11 owner after 300 ms, without submitting extra frames.
+Use `--disable-sync` for an A/B test or `--toplevel` for the non-child control.
+Never use the Fusion prefix. The simple fixture does not reproduce every aspect
+of Fusion's nested surfaces; real Fusion hover and palette checks remain necessary.
+
 ## Paths
 
 - Data, runtime, prefix, Python environment, and build/download cache: `~/.local/share/fusion-on-wine/`.
@@ -155,7 +197,8 @@ Its source-built Wine is not a copy of that machine's distro Wine package.
 Other hardware, compositors, and Fusion releases are not claimed to behave identically.
 
 Validation explicitly selected the AMD GPU.
-The launcher does not hardcode a GPU or Vulkan ICD; automatic GPU selection and NVIDIA remain unverified.
+The launcher does not hardcode a GPU or Vulkan ICD; automatic multi-GPU selection remains unverified.
+NVIDIA/Sway hover highlighting was subsequently validated with the offscreen presentation workaround above; this is not comprehensive NVIDIA workflow validation.
 On multi-GPU systems, `DXVK_FILTER_DEVICE_NAME` can select a device by a substring of its name shown by `./fusion.sh doctor`.
 DXVK can still log shared-handle errors even when the data panel renders correctly.
 CAM, export, save-and-reopen, and long editing sessions have not been comprehensively verified.

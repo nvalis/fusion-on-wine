@@ -6,7 +6,8 @@
     "sha256": "4820066eda68e553d330239ffc628164a348d1c623e49d058e011c5a7cda95f1",
     "patches": [
       "internal/patches/wine.patch",
-      "internal/patches/wine-palettes.patch"
+      "internal/patches/wine-palettes.patch",
+      "internal/patches/wine-present.patch"
     ]
   },
   "winetricks": {

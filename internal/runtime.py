@@ -60,11 +60,22 @@ class Settings:
         env.pop("WINEDLLOVERRIDES", None)
         env.pop("FUSION_WINE_MANAGED_PALETTES", None)
         env.pop("FUSION_WINE_EMBED_PALETTES", None)
+        # Presentation synchronization belongs to Fusion, not prefix setup or sign-in.
+        env.pop("FUSION_WINE_SYNC_PRESENT", None)
+        env.pop("FUSION_WINE_READBACK_PRESENT", None)  # retired diagnostic switch
         if fusion and env.get("SWAYSOCK"):
             env["FUSION_WINE_EMBED_PALETTES"] = "1"
         if fusion:
             # Fusion ships its own compilers. Wine's compiler breaks OGS shading and redraws.
             env["WINEDLLOVERRIDES"] = FUSION_DLL_OVERRIDES
+            # Read back the offscreen X11 drawable before copying its latest frame.
+            # An explicit 0 allows A/B diagnosis without rebuilding Wine.
+            env["FUSION_WINE_SYNC_PRESENT"] = os.environ.get("FUSION_WINE_SYNC_PRESENT", "1")
+            # DXVK's swap-chain latency is separate from NVIDIA's OpenGL frame queue.
+            env["DXVK_CONFIG_FILE"] = str(ROOT / "internal/dxvk.conf")
+            # Retain the OpenGL latency default; it does not fix stale X11 copies.
+            # Restrict queued frames to one; preserve an explicit user override.
+            env.setdefault("__GL_MaxFramesAllowed", "1")
         return env
 
 
@@ -276,7 +287,7 @@ def installation_guard(settings):
             lock.close()
 
 
-def check_runtime(settings):
+def check_runtime(settings, *, allow_old_patches=False):
     from .setup import fingerprint
     if not settings.wine.is_file() or not settings.server.is_file():
         raise RuntimeError("Private Wine is missing. Run ./install.sh.")
@@ -285,7 +296,7 @@ def check_runtime(settings):
     if version != expected:
         raise RuntimeError(f"Expected {expected}, found {version}. Do not mix runtime and driver versions.")
     marker = settings.runtime / ".fusion-on-wine-build.json"
-    if marker.exists() and json.loads(marker.read_text()) != fingerprint(manifest()):
+    if not allow_old_patches and marker.exists() and json.loads(marker.read_text()) != fingerprint(manifest()):
         raise RuntimeError("The runtime's patches differ from this checkout. Close Fusion and rerun installation.")
 
 
@@ -369,6 +380,8 @@ def doctor(settings):
         print("Bundled shader compiler:", bundled_shader_compiler(executable))
         print("Fusion DLL overrides:", FUSION_DLL_OVERRIDES)
         print("DXVK device filter:", os.environ.get("DXVK_FILTER_DEVICE_NAME", "automatic"))
+        print("Offscreen presentation synchronization:",
+              "enabled" if settings.env(fusion=True)["FUSION_WINE_SYNC_PRESENT"] == "1" else "disabled")
         if version != spec["fusion"]["tested_version"]:
             print("Warning: unvalidated Fusion release.")
     except RuntimeError as error:
@@ -476,7 +489,9 @@ def main(argv=None):
         elif command == "uninstall":
             uninstall_entries(settings)
         elif command == "stop":
-            check_runtime(settings)
+            # Updating the patch manifest must not prevent stopping the old
+            # runtime's services before rebuilding. Still verify Wine's version.
+            check_runtime(settings, allow_old_patches=True)
             return subprocess.run([settings.server, "-k"], env=settings.env()).returncode
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
