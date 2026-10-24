@@ -1,8 +1,10 @@
 """Launch, configuration, desktop integration, and read-only diagnostics."""
 import argparse
+import configparser
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,6 +39,7 @@ class Settings:
     python: Path
     config: Path
     previous_callback: str = ""
+    dxvk_device_filter: str = ""
 
     @property
     def wine(self):
@@ -49,7 +52,7 @@ class Settings:
     def env(self, *, fusion=False):
         env = dict(os.environ)
         env.update(WINEPREFIX=str(self.prefix), WINESERVER=str(self.server), WINEARCH="win64",
-                   WINEDEBUG=env.get("WINEDEBUG", "-all,+err"), QTWEBENGINE_DISABLE_SANDBOX="1",
+                   WINEDEBUG=env.get("WINEDEBUG", "-all,err+all"), QTWEBENGINE_DISABLE_SANDBOX="1",
                    QTWEBENGINE_CHROMIUM_FLAGS=env.get("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox"),
                    FUSION_WINE_LOG_DIR=str(self.logs))
         env.pop("WAYLAND_DISPLAY", None)
@@ -73,6 +76,8 @@ class Settings:
             env["FUSION_WINE_SYNC_PRESENT"] = os.environ.get("FUSION_WINE_SYNC_PRESENT", "1")
             # DXVK's swap-chain latency is separate from NVIDIA's OpenGL frame queue.
             env["DXVK_CONFIG_FILE"] = str(ROOT / "internal/dxvk.conf")
+            if self.dxvk_device_filter:
+                env.setdefault("DXVK_FILTER_DEVICE_NAME", self.dxvk_device_filter)
             # Retain the OpenGL latency default; it does not fix stale X11 copies.
             # Restrict queued frames to one; preserve an explicit user override.
             env.setdefault("__GL_MaxFramesAllowed", "1")
@@ -98,13 +103,15 @@ def load_settings(*, installing=False, home=None):
     python = home / "python/bin/python"
     if not python.is_file():
         python = Path(sys.executable)
-    return Settings(home, prefix, runtime, home / "cache", logs, python, config, saved.get("previous_callback", ""))
+    return Settings(home, prefix, runtime, home / "cache", logs, python, config,
+                    saved.get("previous_callback", ""), saved.get("dxvk_device_filter", ""))
 
 
 def save_settings(settings, previous_callback=""):
     settings.config.parent.mkdir(parents=True, exist_ok=True)
     contents = {"home": str(settings.home), "prefix": str(settings.prefix), "runtime": str(settings.runtime),
-                "previous_callback": previous_callback or settings.previous_callback}
+                "previous_callback": previous_callback or settings.previous_callback,
+                "dxvk_device_filter": settings.dxvk_device_filter}
     temp = settings.config.with_suffix(".tmp")
     temp.write_text(json.dumps(contents, indent=2) + "\n")
     temp.chmod(0o600)
@@ -168,14 +175,53 @@ def desktop_argument(value):
     return '"' + value + '"'
 
 
+def desktop_values(path):
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read_string(path.read_text())
+    except (OSError, UnicodeError, configparser.Error):
+        return {}
+    return dict(parser["Desktop Entry"]) if parser.has_section("Desktop Entry") else {}
+
+
+def fusion_icon(directory):
+    icons = xdg("XDG_DATA_HOME", ".local/share") / "icons"
+    if any(icons.glob("hicolor/*/apps/fusion-wine.png")):
+        return "fusion-wine"
+    generated = directory / "wine/Programs/Autodesk/Autodesk Fusion.desktop"
+    icon = desktop_values(generated).get("Icon", "")
+    return icon if icon and "\n" not in icon and "\r" not in icon else "applications-engineering"
+
+
+def retire_legacy_launcher(settings, directory):
+    legacy = directory / "fusion-wine.desktop"
+    values = desktop_values(legacy)
+    commands = {f"{ROOT / 'fusion.sh'} launch", f"{desktop_argument(ROOT / 'fusion.sh')} launch"}
+    if (values.get("Type") != "Application" or values.get("Exec") not in commands
+            or values.get("Name") not in {"Autodesk Fusion", "Autodesk Fusion (Wine)"}):
+        return
+    contents = legacy.read_bytes()
+    backups = settings.home / "desktop-backups"
+    backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup = backups / (legacy.stem + "-" + hashlib.sha256(contents).hexdigest()[:12] + ".desktop")
+    if not backup.exists():
+        with backup.open("xb") as output:
+            output.write(contents)
+        backup.chmod(0o600)
+    if backup.read_bytes() != contents:
+        raise RuntimeError("The legacy launcher backup differs; refusing to remove the original shortcut.")
+    legacy.unlink()
+
+
 def install_entries(settings):
     directory = xdg("XDG_DATA_HOME", ".local/share") / "applications"
     directory.mkdir(parents=True, exist_ok=True)
     command = desktop_argument(ROOT / "fusion.sh")
     (directory / APP_ENTRY).write_text(
-        "[Desktop Entry]\nType=Application\nName=Autodesk Fusion (Wine)\n"
+        "[Desktop Entry]\nType=Application\nName=Autodesk Fusion\n"
         "Comment=Unofficial Fusion launcher with a private Wine runtime\n"
-        f"Exec={command} launch\nIcon=applications-engineering\nTerminal=false\n"
+        f"Exec={command} launch\nIcon={fusion_icon(directory)}\nTerminal=false\n"
         "Categories=Graphics;Engineering;\nStartupWMClass=fusion360.exe\n")
     (directory / CALLBACK_ENTRY).write_text(
         "[Desktop Entry]\nType=Application\nName=Fusion Autodesk sign-in callback\n"
@@ -186,6 +232,7 @@ def install_entries(settings):
         previous = settings.previous_callback
     save_settings(settings, previous)
     subprocess.run(["xdg-mime", "default", CALLBACK_ENTRY, SCHEME], check=True)
+    retire_legacy_launcher(settings, directory)
     subprocess.run(["update-desktop-database", str(directory)], check=False)
 
 
@@ -269,6 +316,16 @@ def bundled_shader_compiler(executable):
     raise RuntimeError("Fusion's bundled d3dcompiler_47.dll is missing. Repair the Autodesk installation; "
                        "Wine's shader compiler is not a working replacement.")
 
+def check_shader_compiler(settings, executable):
+    from .setup import sha256
+    source = bundled_shader_compiler(executable)
+    target = settings.prefix / "drive_c/windows/system32/d3dcompiler_47.dll"
+    if not target.is_file() or sha256(target) != sha256(source):
+        raise RuntimeError("Fusion's bundled native shader compiler is not staged in system32. "
+                           "Save and close Fusion, then rerun installation. Models and credentials are preserved.")
+    return source
+
+
 # Commands
 
 @contextmanager
@@ -315,7 +372,7 @@ def launch(settings):
     # A running install must not race application startup or runtime replacement.
     with installation_guard(settings):
         executable = find_executable(settings.prefix)
-        bundled_shader_compiler(executable)
+        check_shader_compiler(settings, executable)
         prepare_preferences(settings.prefix)
         version = fusion_version(executable)
         if version != manifest()["fusion"]["tested_version"]:
@@ -377,9 +434,10 @@ def doctor(settings):
         executable = find_executable(settings.prefix)
         version = fusion_version(executable)
         print("Fusion:", version, "(tested: " + spec["fusion"]["tested_version"] + ")")
-        print("Bundled shader compiler:", bundled_shader_compiler(executable))
+        print("Bundled shader compiler:", check_shader_compiler(settings, executable))
+        print("Native shader compiler staging: verified")
         print("Fusion DLL overrides:", FUSION_DLL_OVERRIDES)
-        print("DXVK device filter:", os.environ.get("DXVK_FILTER_DEVICE_NAME", "automatic"))
+        print("DXVK device filter:", settings.env(fusion=True).get("DXVK_FILTER_DEVICE_NAME", "automatic"))
         print("Offscreen presentation synchronization:",
               "enabled" if settings.env(fusion=True)["FUSION_WINE_SYNC_PRESENT"] == "1" else "disabled")
         if version != spec["fusion"]["tested_version"]:

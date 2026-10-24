@@ -1,19 +1,15 @@
 From: Fusion on Wine maintainers
-Subject: [PATCH] Synchronize offscreen presentation before copying into X11 owners
+Subject: [PATCH] Synchronize complete offscreen drawables before X11 owner copies
 
-On NVIDIA/XWayland, Fusion can render the current hover highlight into its
-redirected child drawable while the owner receives the previous frame. The
-stale image persists until the next present, even with DXVK maxFrameLatency=1.
+Fusion can leave the visible owner one frame behind its redirected Vulkan
+drawable. A present-ID wait and one-pixel X11 readback were insufficient
+on a GTX 1060 with NVIDIA 580.178.04 and XWayland. Full-drawable readback
+passed repeated real Fusion hover transitions on both NVIDIA and AMD.
 
-Opt in only for Fusion via FUSION_WINE_SYNC_PRESENT=1. Retain the tested Vulkan
-present-ID wait and X11 round trip, then read one pixel of the source drawable
-before the GDI copy. The readback was necessary in actual Fusion: a present
-wait plus XSync alone passed a simple fixture but did not fix the application.
-Do not imply that vkQueueWaitIdle or XSync alone guarantees this ordering.
-
-This is a synchronous compatibility workaround, not a general Wine rendering
-optimization. It adds readback overhead and is deliberately opt-in. Keep the
-existing GDI region/palette clipping and do not poll or synthesize input.
+Keep this synchronous compatibility path opt-in through
+FUSION_WINE_SYNC_PRESENT=1. It has GPU-stall and readback-bandwidth costs,
+and is not a general rendering performance improvement. Preserve GDI
+clipping, palette handling, and the bounded Vulkan present-ID wait.
 
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
@@ -41,21 +37,41 @@ existing GDI region/palette clipping and do not poll or synthesize input.
          if (swapchain_res < VK_SUCCESS) continue;
 --- a/dlls/winex11.drv/init.c
 +++ b/dlls/winex11.drv/init.c
-@@ -406,6 +406,18 @@
+@@ -379,6 +379,12 @@
+     client_surface_update_offscreen( hwnd, surface );
+ }
+ 
++static int present_readback_error( Display *display, XErrorEvent *event, void *arg )
++{
++    /* The drawable may have resized or disappeared before the X11 request. */
++    return event->error_code == BadMatch || event->error_code == BadDrawable;
++}
++
+ static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
+ {
+     struct x11drv_client_surface *surface = impl_from_client_surface( client );
+@@ -406,6 +412,25 @@
                           !NtUserGetWindowRelative( toplevel, GW_OWNER ) ? ClipByChildren : IncludeInferiors );
      if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
  
 +    if (getenv( "FUSION_WINE_SYNC_PRESENT" ) &&
 +        !strcmp( getenv( "FUSION_WINE_SYNC_PRESENT" ), "1" ))
 +    {
++        int width = rect_src.right - rect_src.left, height = rect_src.bottom - rect_src.top;
 +        XImage *image;
 +
-+        /* Presentation completion alone can still leave the following owner
-+         * copy one frame behind on NVIDIA/XWayland. Read the redirected source
-+         * before copying it. This path is only reached for offscreen surfaces. */
-+        XSync( gdi_display, False );
-+        image = XGetImage( gdi_display, surface->window, 0, 0, 1, 1, AllPlanes, ZPixmap );
-+        if (image) XDestroyImage( image );
++        /* A present wait and a one-pixel readback can still leave the owner
++         * one frame behind. Read the complete redirected drawable before the
++         * existing GDI copy. This compatibility path adds GPU readback cost. */
++        if (width > 0 && height > 0)
++        {
++            XSync( gdi_display, False );
++            X11DRV_expect_error( gdi_display, present_readback_error, NULL );
++            image = XGetImage( gdi_display, surface->window, 0, 0, width, height, AllPlanes, ZPixmap );
++            X11DRV_check_error();
++            if (image) XDestroyImage( image );
++            else WARN( "Could not synchronize offscreen drawable %lx\n", surface->window );
++        }
 +    }
      NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                       surface->hdc_src, 0, 0, rect_src.right - rect_src.left, rect_src.bottom - rect_src.top, SRCCOPY, 0 );

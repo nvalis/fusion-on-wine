@@ -28,7 +28,7 @@ ARCH_PACKAGES = [
     "gst-plugins-base-libs", "ffmpeg", "zlib", "bzip2", "xz",
 ]
 REQUIRED_COMMANDS = ["gcc", "g++", "make", "patch", "pkg-config", "flex", "bison",
-                     "x86_64-w64-mingw32-gcc", "i686-w64-mingw32-gcc", "cabextract", "unzip", "curl", "7z", "xdg-mime", "update-desktop-database"]
+                     "cabextract", "unzip", "curl", "7z", "xdg-mime", "update-desktop-database"]
 REQUIRED_LIBRARIES = ["x11", "xext", "xrandr", "xcursor", "xi", "xfixes", "xrender", "xcomposite",
                       "freetype2", "fontconfig", "gnutls", "gl", "vulkan"]
 
@@ -56,6 +56,12 @@ def dependencies():
     missing = [name for name in REQUIRED_COMMANDS if shutil.which(name) is None]
     if missing:
         raise RuntimeError("Missing host tools: " + ", ".join(missing) + ". See README.md.")
+    mingw = ("x86_64-w64-mingw32-gcc", "i686-w64-mingw32-gcc")
+    llvm = ("clang", "lld", "llvm-dlltool")
+    if not (all(shutil.which(name) for name in mingw) or all(shutil.which(name) for name in llvm)):
+        raise RuntimeError("Missing Windows cross-compiler toolchain. Install both "
+                           "x86_64-w64-mingw32-gcc and i686-w64-mingw32-gcc, "
+                           "or clang, lld, and llvm-dlltool. See README.md.")
     missing = [name for name in REQUIRED_LIBRARIES
                if subprocess.run(["pkg-config", "--exists", name], stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL).returncode]
@@ -311,6 +317,32 @@ def setup_dxvk(settings, spec, *, allow_upgrade=False):
     write_json(marker, state)
 
 
+def setup_shader_compiler(settings, executable):
+    """Stage Fusion's own x64 compiler for callers that explicitly load system32."""
+    if not (settings.prefix / PREFIX_MARKER).is_file():
+        raise RuntimeError("Refusing to stage a shader compiler in an unmanaged prefix.")
+    source = bundled_shader_compiler(executable)
+    target = settings.prefix / "drive_c/windows/system32/d3dcompiler_47.dll"
+    if target.is_file() and sha256(target) == sha256(source):
+        print("Bundled native shader compiler is already staged.")
+        return
+    if active_prefix_processes(settings.prefix):
+        raise RuntimeError("Save and close this prefix's Wine applications and services, then rerun installation "
+                           "to stage Fusion's native shader compiler. Existing data was not deleted.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup = target.with_name(target.name + ".before-fusion-native-compiler")
+    if target.exists() and not backup.exists():
+        shutil.copy2(target, backup)
+    temporary = target.with_name(target.name + ".new")
+    try:
+        shutil.copy2(source, temporary)
+        # wineboot may install symlinks. Replace the link, never its runtime target.
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print("Staged Fusion's bundled native shader compiler in its private prefix.")
+
+
 def install_fusion(settings, spec, refresh=False):
     try:
         executable = find_executable(settings.prefix)
@@ -388,7 +420,7 @@ def install(settings, args):
         if args.upgrade_graphics:
             prepare_preferences(settings.prefix, force_graphics=True)
         executable = install_fusion(settings, spec, args.refresh_fusion)
-        bundled_shader_compiler(executable)
+        setup_shader_compiler(settings, executable)
         install_entries(settings)
     print("Installation complete. Sign in yourself after running ./fusion.sh.")
     print("If Autodesk opened Fusion during installation, close it first so the graphics defaults load on restart.")
