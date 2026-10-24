@@ -36,9 +36,10 @@ def is_overlay(window, owner):
         return False
     if window.opacity is None or not 0 <= window.opacity < 1:
         return False
-    x, y, w, h = window.rect
-    ox, oy, ow, oh = owner.rect
-    return abs(x - ox) <= 16 and abs(y - oy) <= 96 and abs(w - ow) <= 8 and 0.9 * oh <= h <= 1.2 * oh
+    # Fusion can size this dimming surface to the monitor, not its owner.
+    # The exact title, transient owner, window type, PID, and opacity identify
+    # it more reliably than geometry, which varies with tiling and display size.
+    return True
 
 
 def match_client(info, clients):
@@ -187,6 +188,7 @@ class Watcher:
         self.next_focus_poll = 0
         self.pending = {}
         self.handled = {}
+        self.opacity_applied = {}
         self.tracked = set()
         self.next_scan = 0
         self.geometry_pending = True
@@ -253,7 +255,43 @@ class Watcher:
         self.geometry_pending = True
         self.display.flush()
 
-    def sync_geometry(self):
+    def sync_opacity(self, infos, clients):
+        """Translate Wine's X11 opacity requests independently of modal heuristics."""
+        for xid, info in infos.items():
+            client = clients.get(xid)
+            if client is None:
+                continue
+            key = (xid, client["address"])
+            # Removing the X11 property restores full opacity. Leave windows
+            # without a request alone unless we previously changed them.
+            if info.opacity is None and key not in self.opacity_applied:
+                continue
+            if key in self.opacity_applied and self.opacity_applied[key] == info.opacity:
+                continue
+            alpha = str(info.opacity if info.opacity is not None else 1.0)
+            for prop in ("opacity", "opacity_inactive", "opacity_fullscreen"):
+                setprop(client["address"], prop, alpha)
+            if info.opacity is None:
+                self.opacity_applied.pop(key, None)
+            else:
+                self.opacity_applied[key] = info.opacity
+            print(f"Synchronized X11 window opacity {alpha}", flush=True)
+        self.opacity_applied = {
+            key: value for key, value in self.opacity_applied.items()
+            if key[0] in infos and (key[0] not in clients or clients[key[0]]["address"] == key[1])
+        }
+
+    def sync_windows(self):
+        infos = {}
+        for window in self.root.query_tree().children:
+            info = self.read(window)
+            if info is not None:
+                infos[info.xid] = info
+        clients = associate_clients(infos, json.loads(hypr("-j", "clients")), self.client_addresses)
+        self.client_addresses = {xid: c["address"] for xid, c in clients.items()}
+        # Opacity is dimensionless. It also works on mixed-DPI desktops where
+        # the geometry repair below deliberately does not run.
+        self.sync_opacity(infos, clients)
         now = time.monotonic()
         if now >= self.next_geometry_monitors:
             monitors = json.loads(hypr("-j", "monitors"))
@@ -263,13 +301,6 @@ class Watcher:
             self.next_geometry_monitors = now + 1
         if not self.geometry_enabled:
             return
-        infos = {}
-        for window in self.root.query_tree().children:
-            info = self.read(window)
-            if info is not None:
-                infos[info.xid] = info
-        clients = associate_clients(infos, json.loads(hypr("-j", "clients")), self.client_addresses)
-        self.client_addresses = {xid: c["address"] for xid, c in clients.items()}
         commands = []
         repaired = []
         for xid, info in infos.items():
@@ -301,13 +332,9 @@ class Watcher:
             return False  # XWayland has mapped it, but Hyprland has not registered it yet.
         key = (info.xid, client["address"])
         state = self.handled.setdefault(key, {})
-        if state.get("opacity") != info.opacity:
-            alpha = str(info.opacity)
-            for prop in ("opacity", "opacity_inactive", "opacity_fullscreen"):
-                setprop(client["address"], prop, alpha)
+        if not state.get("no_focus"):
             setprop(client["address"], "no_focus", "on")
-            state["opacity"] = info.opacity
-            print(f"Applied modal overlay opacity {info.opacity:.3f}", flush=True)
+            state["no_focus"] = True
         dialogs = []
         for window in self.root.query_tree().children:
             candidate = self.read(window)
@@ -416,7 +443,7 @@ class Watcher:
                 self.next_scan = time.monotonic() + 1
             if self.geometry_pending and time.monotonic() >= self.next_geometry_poll:
                 try:
-                    self.sync_geometry()
+                    self.sync_windows()
                 except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, error.XError):
                     pass
                 self.geometry_pending = False

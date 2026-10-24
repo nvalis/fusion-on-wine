@@ -215,9 +215,12 @@ Rerun installation after a Fusion update changes its bundled compiler.
 The Photo Booth environment is set once after account settings appear, not reset on every launch.
 Autodesk's Qt DLLs and certificate verification remain unchanged.
 
-On Hyprland, the helper repairs modal overlay opacity, stacking, palette focus, and missed palette geometry updates.
+On Hyprland, the helper translates `_NET_WM_WINDOW_OPACITY` for every Fusion window that requests it, regardless of its title, type, owner, or size.
+Hyprland 0.56.2 does not apply this X11 property itself, so Wine's constant-alpha dimmers otherwise appear solid black.
+The helper follows opacity changes and restores full opacity when Wine removes the property.
+It separately repairs modal stacking, palette focus, and missed palette geometry updates.
 It copies confirmed X11 geometry, refuses ambiguous window matches, and acts only on its Fusion process.
-The geometry compatibility fix requires scale-1 monitors.
+The geometry compatibility fix requires scale-1 monitors; opacity translation does not.
 
 ## Compatibility and privacy
 
