@@ -134,6 +134,9 @@ Patch hashes participate in the runtime fingerprint, so an older runtime cannot 
 `./fusion.sh doctor` checks both presentation synchronization and native compiler staging.
 
 Run non-graphical tests with `python -m unittest discover -s tests`.
+On Hyprland, `python tests/check_palette_geometry.py` checks palette placement using a synthetic X11 window on unused workspace 98.
+It verifies initial placement and recovery after another displacement without switching workspaces, moving the pointer, or opening a Wine prefix.
+Use `--workspace NUMBER` to choose a different unused workspace.
 For an opt-in graphical regression check, compile `tests/present_latency.cpp` using the command in its header, put DXVK's x64 `d3d11.dll` and `dxgi.dll` beside the executable, and run:
 
 ```sh
@@ -219,7 +222,11 @@ On Hyprland, the helper translates `_NET_WM_WINDOW_OPACITY` for every Fusion win
 Hyprland 0.56.2 does not apply this X11 property itself, so Wine's constant-alpha dimmers otherwise appear solid black.
 The helper follows opacity changes and restores full opacity when Wine removes the property.
 It separately repairs modal stacking, palette focus, and missed palette geometry updates.
-It copies confirmed X11 geometry, refuses ambiguous window matches, and acts only on its Fusion process.
+Wine's `WM_NORMAL_HINTS` retain the application-requested palette position and fixed size even when Hyprland moves the X11 window itself.
+The helper restores those coordinates instead of copying the misplaced X11 position or guessing offsets from the main window.
+It refuses ambiguous window matches and acts only on its Fusion process.
+Application-menu launches can omit `HYPRLAND_INSTANCE_SIGNATURE`; the launcher recovers it by matching `WAYLAND_DISPLAY` to `hyprctl -j instances`.
+It does not choose between ambiguous sessions or require compositor patches.
 The geometry compatibility fix requires scale-1 monitors; opacity translation does not.
 
 ## Compatibility and privacy

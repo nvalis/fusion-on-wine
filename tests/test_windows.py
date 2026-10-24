@@ -3,7 +3,11 @@ import json
 import unittest
 from unittest.mock import call, patch
 
-from internal.helpers.windows import WindowInfo, Watcher, associate_clients, is_overlay
+from Xlib import Xutil
+
+from internal.helpers.windows import (
+    WindowInfo, Watcher, associate_clients, geometry_commands, is_overlay, requested_geometry,
+)
 
 
 class OverlayTests(unittest.TestCase):
@@ -36,6 +40,71 @@ class OverlayTests(unittest.TestCase):
         for window, owner in cases:
             with self.subTest(window=window, owner=owner):
                 self.assertFalse(is_overlay(window, owner))
+
+
+class GeometryTests(unittest.TestCase):
+    def setUp(self):
+        self.actual = (3708, 613, 250, 453)
+        # Real WM_NORMAL_HINTS from the misplaced sketch palette.
+        self.hints = [564, 4844, 349, 0, 0, 250, 453, 250, 453, 0, 0, 0, 0, 0, 0, 0, 0, 10]
+        self.info = WindowInfo(
+            7, 123, "Fusion360", self.actual, 1, None, "_NET_WM_WINDOW_TYPE_DIALOG", True,
+            requested_geometry(self.actual, self.hints),
+        )
+        self.client = {
+            "address": "0x123", "class": "fusion360.exe", "pid": 123, "title": "Fusion360",
+            "at": [3708, 613], "size": [250, 453], "floating": True,
+        }
+
+    def test_restores_win32_position_not_compositor_position(self):
+        self.assertEqual(self.info.requested_rect, (4844, 349, 250, 453))
+        self.assertEqual(geometry_commands(self.info, self.client), [
+            "dispatch movewindowpixel exact 4844 349,address:0x123",
+        ])
+
+    def test_association_still_uses_actual_geometry(self):
+        other = replace(self.info, xid=8, rect=(2971, 179, 300, 1160))
+        other_client = {**self.client, "address": "0x456", "at": [2971, 179], "size": [300, 1160]}
+        clients = associate_clients({7: self.info, 8: other}, [other_client, self.client], {})
+        self.assertEqual(clients[7]["address"], "0x123")
+        self.assertEqual(clients[8]["address"], "0x456")
+
+    def test_repair_is_idempotent(self):
+        fixed = {**self.client, "at": [4844, 349]}
+        self.assertEqual(geometry_commands(self.info, fixed), [])
+
+    def test_managed_windows_are_not_repositioned(self):
+        self.assertEqual(geometry_commands(replace(self.info, override_redirect=False), self.client), [])
+
+    def test_missing_or_short_hints_preserve_actual_geometry(self):
+        for hints in (None, [], [1, 2], [0] * 8):
+            with self.subTest(hints=hints):
+                self.assertEqual(requested_geometry(self.actual, hints), self.actual)
+
+    def test_unflagged_values_are_ignored(self):
+        self.hints[0] = 0
+        self.assertEqual(requested_geometry(self.actual, self.hints), self.actual)
+
+    def test_negative_monitor_coordinates(self):
+        self.hints[1:3] = [(-1400) & 0xffffffff, (-200) & 0xffffffff]
+        self.assertEqual(requested_geometry(self.actual, self.hints), (-1400, -200, 250, 453))
+
+    def test_explicit_size_and_position(self):
+        self.hints[:5] = [Xutil.USPosition | Xutil.USSize, 100, 200, 300, 400]
+        self.assertEqual(requested_geometry(self.actual, self.hints), (100, 200, 300, 400))
+
+    def test_fixed_size_restores_compositor_resize(self):
+        self.assertEqual(requested_geometry((3708, 613, 500, 600), self.hints), (4844, 349, 250, 453))
+
+    def test_resizable_hints_do_not_force_a_size(self):
+        self.hints[7:9] = [1000, 1000]
+        self.assertEqual(requested_geometry(self.actual, self.hints), (4844, 349, 250, 453))
+
+    def test_invalid_sizes_are_ignored(self):
+        for width, height in ((0, 0), (0xffffffff, 453), (250, 100000)):
+            with self.subTest(size=(width, height)):
+                self.hints[5:9] = [width, height, width, height]
+                self.assertEqual(requested_geometry(self.actual, self.hints), (4844, 349, 250, 453))
 
 
 class OpacityTests(unittest.TestCase):

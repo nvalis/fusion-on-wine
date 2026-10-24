@@ -357,13 +357,52 @@ def check_runtime(settings, *, allow_old_patches=False):
         raise RuntimeError("The runtime's patches differ from this checkout. Close Fusion and rerun installation.")
 
 
+def hyprland_signature():
+    """Recover the session omitted by some systemd-launched application menus."""
+    if os.environ.get("SWAYSOCK"):
+        return ""
+    if signature := os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return signature
+    wayland = os.environ.get("WAYLAND_DISPLAY")
+    desktop_is_hyprland = "hyprland" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
+    if not wayland or shutil.which("hyprctl") is None:
+        if desktop_is_hyprland:
+            raise RuntimeError("Cannot identify the Hyprland session. Check WAYLAND_DISPLAY and hyprctl.")
+        return ""
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+
+    def socket_path(name):
+        path = Path(name)
+        return path if path.is_absolute() else runtime / path
+
+    try:
+        result = subprocess.run(["hyprctl", "-j", "instances"], capture_output=True,
+                                text=True, timeout=3, check=True)
+        instances = json.loads(result.stdout)
+        if not isinstance(instances, list):
+            raise ValueError("Invalid Hyprland instance list")
+        matches = [item["instance"] for item in instances
+                   if isinstance(item, dict) and isinstance(item.get("instance"), str)
+                   and item.get("wl_socket") and socket_path(item["wl_socket"]) == socket_path(wayland)]
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        if desktop_is_hyprland:
+            raise RuntimeError("Could not discover the Hyprland session through hyprctl.") from None
+        return ""
+    if len(matches) > 1:
+        raise RuntimeError("Multiple Hyprland instances use this Wayland socket; set HYPRLAND_INSTANCE_SIGNATURE.")
+    if not matches and desktop_is_hyprland:
+        raise RuntimeError("No Hyprland instance matches WAYLAND_DISPLAY; restart the application menu in this session.")
+    return matches[0] if matches else ""
+
+
 def launch(settings):
     from .setup import host_check
     host_check()
     check_runtime(settings)
     if not os.environ.get("DISPLAY"):
         raise RuntimeError("No X11/XWayland display is available. Launch from your graphical desktop.")
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and not os.environ.get("SWAYSOCK"):
+    signature = hyprland_signature()
+    if signature:
         if shutil.which("hyprctl") is None:
             raise RuntimeError("Hyprland's hyprctl is missing.")
         if subprocess.run([settings.python, "-c", "import Xlib"], stdout=subprocess.DEVNULL,
@@ -380,6 +419,8 @@ def launch(settings):
         settings.logs.mkdir(parents=True, exist_ok=True, mode=0o700)
         settings.logs.chmod(0o700)
         env = settings.env(fusion=True)
+        if signature:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = signature
         with (settings.logs / "fusion.log").open("a") as log:
             process = subprocess.Popen([settings.wine, executable], cwd=executable.parent, env=env,
                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -471,11 +512,16 @@ def doctor(settings):
     print("DISPLAY:", os.environ.get("DISPLAY", "missing"))
     if not os.environ.get("DISPLAY"):
         problems.append("No X11/XWayland display is available in this session.")
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+    try:
+        signature = hyprland_signature()
+    except RuntimeError as error:
+        signature = ""
+        problems.append(str(error))
+    if signature:
         if shutil.which("hyprctl"):
-            result = subprocess.run(["hyprctl", "version"], capture_output=True, text=True)
+            result = subprocess.run(["hyprctl", "-i", signature, "version"], capture_output=True, text=True)
             print(result.stdout.splitlines()[0] if result.stdout else "Hyprland IPC unavailable")
-            monitors = subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, text=True)
+            monitors = subprocess.run(["hyprctl", "-i", signature, "-j", "monitors"], capture_output=True, text=True)
             try:
                 if any(m["scale"] != 1 for m in json.loads(monitors.stdout)):
                     print("Warning: palette geometry compatibility fix is disabled on scaled monitors.")

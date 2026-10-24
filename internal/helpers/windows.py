@@ -11,7 +11,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from Xlib import X, display, error, protocol
+from Xlib import X, Xutil, display, error, protocol
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,26 @@ class WindowInfo:
     opacity: float | None
     kind: str
     override_redirect: bool = False
+    requested_rect: tuple[int, int, int, int] | None = None
+
+
+def requested_geometry(rect, hints):
+    """Wine's size hints retain Win32 intent when the compositor moves an X window."""
+    if hints is None or len(hints) < 9:
+        return rect
+    x, y, width, height = rect
+    flags, hx, hy, hw, hh, min_w, min_h, max_w, max_h = map(int, hints[:9])
+    if flags & (Xutil.PPosition | Xutil.USPosition):
+        # Xlib returns CARD32 values, including signed coordinates encoded in them.
+        x = hx if hx < 0x80000000 else hx - 0x100000000
+        y = hy if hy < 0x80000000 else hy - 0x100000000
+    if flags & (Xutil.PSize | Xutil.USSize):
+        if 0 < hw <= 65535 and 0 < hh <= 65535:
+            width, height = hw, hh
+    elif flags & Xutil.PMinSize and flags & Xutil.PMaxSize:
+        if (min_w, min_h) == (max_w, max_h) and 0 < min_w <= 65535 and 0 < min_h <= 65535:
+            width, height = min_w, min_h
+    return x, y, width, height
 
 
 def is_overlay(window, owner):
@@ -93,10 +113,11 @@ def associate_clients(infos, clients, previous):
 
 
 def geometry_commands(info, client, owner_client=None):
-    """Copy confirmed X11 geometry, not guessed offsets relative to the main window."""
+    """Restore application-requested geometry without guessing offsets from the owner."""
     if not info.override_redirect or not client.get("floating") or client.get("fullscreen", 0):
         return []
-    if client.get("hidden") or min(info.rect[2:]) <= 1:
+    rect = info.requested_rect or info.rect
+    if client.get("hidden") or min(rect[2:]) <= 1:
         return []
     address = "address:" + client["address"]
     commands = []
@@ -110,7 +131,7 @@ def geometry_commands(info, client, owner_client=None):
             target = str(owner_client["workspace"]["id"])
         if target is not None:
             commands.append(f"dispatch movetoworkspacesilent {target},{address}")
-    x, y, width, height = info.rect
+    x, y, width, height = rect
     if any(abs(a - b) > 2 for a, b in zip(client["at"], (x, y))):
         commands.append(f"dispatch movewindowpixel exact {x} {y},{address}")
     if any(abs(a - b) > 2 for a, b in zip(client["size"], (width, height))):
@@ -168,7 +189,7 @@ class Watcher:
         self.atoms = {name: self.display.intern_atom(name) for name in (
             "_NET_WM_PID", "_NET_WM_WINDOW_OPACITY", "_NET_WM_WINDOW_TYPE",
             "WM_TRANSIENT_FOR", "WM_NAME", "_NET_WM_NAME", "WM_CLASS",
-            "WM_PROTOCOLS", "WM_TAKE_FOCUS",
+            "WM_PROTOCOLS", "WM_TAKE_FOCUS", "WM_NORMAL_HINTS",
         )}
         self.events = None
         signature = os.environ["HYPRLAND_INSTANCE_SIGNATURE"]
@@ -216,13 +237,21 @@ class Watcher:
             kind = window.get_full_property(self.atoms["_NET_WM_WINDOW_TYPE"], X.AnyPropertyType)
             owner = window.get_wm_transient_for()
             geometry = window.get_geometry()
+            rect = (geometry.x, geometry.y, geometry.width, geometry.height)
+            requested = None
+            if attributes.override_redirect:
+                # python-xlib's get_wm_normal_hints discards the old position and
+                # size fields. Wine still publishes its Win32 geometry there.
+                hints = window.get_full_property(self.atoms["WM_NORMAL_HINTS"], X.AnyPropertyType)
+                if hints is not None and hints.format == 32:
+                    requested = requested_geometry(rect, hints.value)
             return WindowInfo(
                 window.id, self.pid, window.get_wm_name() or "",
-                (geometry.x, geometry.y, geometry.width, geometry.height),
+                rect,
                 owner.id if owner else None,
                 int(opacity.value[0]) / 0xffffffff if opacity is not None else None,
                 self.display.get_atom_name(int(kind.value[0])) if kind is not None and len(kind.value) else "",
-                bool(attributes.override_redirect),
+                bool(attributes.override_redirect), requested,
             )
         except error.XError:
             return None
