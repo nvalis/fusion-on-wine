@@ -9,10 +9,13 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+
+from .helpers import bambu_studio
 
 
 # Paths and environment
@@ -23,6 +26,22 @@ FUSION_DLL_OVERRIDES = "d3dcompiler_47,d3dcompiler_43=n,b"
 
 def manifest():
     return json.loads((ROOT / "internal/versions.json").read_text())
+
+
+def caller_environment():
+    """The caller's environment without the import path fusion.sh adds for this checkout.
+
+    Wine would otherwise hand that path to Fusion's own Python and to every
+    native program started from Fusion.
+    """
+    env = dict(os.environ)
+    paths = [p for p in env.get("PYTHONPATH", "").split(os.pathsep)
+             if not p or os.path.realpath(p) != str(ROOT)]
+    if any(paths):
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
 
 
 def xdg(variable, default):
@@ -50,7 +69,8 @@ class Settings:
         return self.runtime / "bin/wineserver"
 
     def env(self, *, fusion=False, hyprland=""):
-        env = dict(os.environ)
+        caller = caller_environment()
+        env = dict(caller)
         if hyprland:
             # Menu launches can omit the signature; hyprland_signature() recovers it.
             env["HYPRLAND_INSTANCE_SIGNATURE"] = hyprland
@@ -88,6 +108,16 @@ class Settings:
             # Retain the OpenGL latency default; it does not fix stale X11 copies.
             # Restrict queued frames to one; preserve an explicit user override.
             env.setdefault("__GL_MaxFramesAllowed", "1")
+            # The Send to Bambu Studio add-in exports here and starts the native
+            # slicer through this wrapper.
+            env["FUSION_WINE_SLICER_LAUNCHER"] = str(ROOT / "internal/helpers/bambu_studio.py")
+            env["FUSION_WINE_EXPORT_DIR"] = str(self.home / "exports")
+            # Wine execs native programs with Fusion's environment. Record what
+            # the launcher changed so the wrapper can start the slicer with the
+            # desktop session's own values; null marks an added variable.
+            changed = {name: caller.get(name) for name in caller.keys() | env.keys()
+                       if caller.get(name) != env.get(name)}
+            env["FUSION_WINE_HOST_ENV"] = json.dumps(changed, sort_keys=True)
         return env
 
 
@@ -314,6 +344,75 @@ def prepare_preferences(prefix, *, force_graphics=False):
         except (ET.ParseError, RuntimeError) as error:
             print(f"Environment default skipped: {error}")
 
+ADDIN_MARKER = ".fusion-on-wine-managed"
+# Fusion picks the @2x variants on HiDPI displays.
+ICON_SIZES = {"16x16.png": 16, "16x16@2x.png": 32, "32x32.png": 32, "32x32@2x.png": 64}
+
+
+def brand_addin_icons(resources, source):
+    """Use the installed Bambu Studio logo; the repository ships only a generic icon."""
+    rendered = resources.with_name(resources.name + "-branded")
+    shutil.rmtree(rendered, ignore_errors=True)
+    rendered.mkdir()
+    if all(bambu_studio.render_icon(source, size, rendered / name) for name, size in ICON_SIZES.items()):
+        shutil.rmtree(resources)
+        rendered.rename(resources)
+    else:
+        shutil.rmtree(rendered, ignore_errors=True)
+
+
+def addin_fingerprint(source, icon=None):
+    """Changes with the bundled files and, for a branded add-in, the logo and its renderers."""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in source.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
+        digest.update(path.relative_to(source).as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+    if icon is not None:
+        stat = icon.stat()
+        digest.update(f"{icon}\0{stat.st_mtime_ns}\0{stat.st_size}\0".encode())
+        digest.update(f"{shutil.which('rsvg-convert')}\0{shutil.which('magick')}".encode())
+    return digest.hexdigest()
+
+
+def install_addins(prefix):
+    """Keep the bundled add-ins current without touching user add-ins of the same name.
+
+    An installed copy is replaced only when its fingerprint changes. Failures
+    cost the add-in, never the Fusion launch.
+    """
+    homes = [p for p in prefix.glob("drive_c/users/*/AppData/Roaming")
+             if p.parents[1].name.lower() not in ("public", "default", "default user")]
+    if len(homes) != 1:
+        print("Warning: could not identify the Wine user profile; bundled add-ins were not installed.")
+        return
+    target_root = homes[0] / "Autodesk/Autodesk Fusion 360/API/AddIns"
+    try:
+        icon = bambu_studio.icon_source(os.environ)
+    except OSError:
+        icon = None
+    for source in sorted(p for p in (ROOT / "internal/addins").iterdir() if p.is_dir()):
+        target = target_root / source.name
+        marker = target / ADDIN_MARKER
+        if target.exists() and not marker.exists():
+            print(f"Warning: add-in folder {target.name} is not managed by this launcher; left unchanged.")
+            continue
+        branded = icon if source.name == "SendToBambuStudio" else None
+        staging = target.with_name(target.name + ".fusion-on-wine-new")
+        try:
+            fingerprint = addin_fingerprint(source, branded)
+            if marker.is_file() and marker.read_text() == fingerprint:
+                continue
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.copytree(source, staging, ignore=shutil.ignore_patterns("__pycache__"))
+            if branded is not None:
+                brand_addin_icons(staging / "resources", branded)
+            (staging / ADDIN_MARKER).write_text(fingerprint)
+            shutil.rmtree(target, ignore_errors=True)
+            staging.rename(target)
+        except OSError as error:
+            shutil.rmtree(staging, ignore_errors=True)
+            print(f"Warning: could not install the {source.name} add-in: {error}")
+
+
 def bundled_shader_compiler(executable):
     for folder in (executable.parent, executable.parent / "d3dcompiler_v2", executable.parent / "d3dcompiler_v1"):
         if folder.is_dir():
@@ -452,6 +551,8 @@ def launch(settings):
         executable = find_executable(settings.prefix)
         check_shader_compiler(settings, executable)
         prepare_preferences(settings.prefix)
+        install_addins(settings.prefix)
+        (settings.home / "exports").mkdir(exist_ok=True, mode=0o700)
         version = fusion_version(executable)
         if version != manifest()["fusion"]["tested_version"]:
             print(f"Warning: Fusion {version} is not the tested release {manifest()['fusion']['tested_version']}.")
@@ -548,6 +649,10 @@ def doctor(settings):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if result.returncode:
         problems.append("Python Xlib is missing. Rerun installation to prepare its private Python environment.")
+    slicer = bambu_studio.command([], os.environ)
+    print("Bambu Studio:", shlex.join(slicer) if slicer else "not found; Send to Bambu Studio will report this")
+    if slicer and not shutil.which("dbus-send"):
+        print("Warning: dbus-send is missing; every send opens another Bambu Studio window.")
     print("DISPLAY:", os.environ.get("DISPLAY", "missing"))
     if not os.environ.get("DISPLAY"):
         problems.append("No X11/XWayland display is available in this session.")

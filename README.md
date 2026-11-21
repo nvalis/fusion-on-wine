@@ -113,6 +113,26 @@ The installer backs up replaced DLLs and the original graphics preferences.
 Ordinary launches preserve existing graphics preferences; they do not silently migrate an installation.
 Unmanaged prefixes still require a separate, deliberate migration and are not modified by this command.
 
+### Send to Bambu Studio
+
+Each launch installs the bundled *Send to Bambu Studio* add-in into the prefix and keeps it current.
+Its button sits next to Fusion's own 3D Print command under Utilities > Make.
+It exports the selected bodies, occurrences, or components, or otherwise the whole design, as high-refinement STL files in millimetres, one per body, and opens them in the native Linux Bambu Studio.
+A selected face, edge, or vertex stands for its body; other selections such as sketches are ignored.
+STL avoids the "invalid config" warning and the open-as-project prompt that Bambu Studio shows for 3MF files without printer settings.
+If Bambu Studio is already running, the bodies are added to its current plate instead of opening a second window.
+The files reach the running instance over its D-Bus single-instance interface through `dbus-send`; without `dbus-send`, every send opens another window.
+Wine runs non-Windows executables natively, so no Windows build of Bambu Studio or bridge service is needed.
+Wine starts them with Fusion's environment, so the launcher records every variable it changed for Wine, including the Wayland socket it hides.
+`internal/helpers/bambu_studio.py` restores those values and drops Wine's own, then starts Bambu Studio through its menu entry, including any environment the entry sets.
+It finds `BambuStudio.desktop` or the Flathub `com.bambulab.BambuStudio.desktop`, and falls back to `bambu-studio` on `PATH`.
+Set `FUSION_BAMBU_STUDIO` to use another command; `./fusion.sh doctor` shows the command in use.
+The button shows the Bambu Studio logo from the installed icon theme, rendered with `rsvg-convert` or ImageMagick; without either, a generic icon is used.
+The installed copy is replaced only when the bundled add-in, the logo, or the renderers change, and a failed installation never blocks the launch.
+Exports go to `~/.local/share/fusion-on-wine/exports/`; anything there older than a day is removed on the next export.
+An add-in folder of the same name that this launcher did not install is left unchanged.
+Disable the add-in in Fusion's Scripts and Add-Ins dialog if you do not want it.
+
 ## Delayed hover highlighting
 
 `internal/patches/wine-present.patch` addresses an offscreen viewport copy that can stay one frame behind.
@@ -201,7 +221,8 @@ internal/
   setup.py                    Downloads, Wine build, and installation
   runtime.py                  Configuration, launch, sign-in, and doctor
   versions.json               Pinned versions and download checksums
-  helpers/                    Hyprland window handling
+  helpers/                    Hyprland window handling and the Bambu Studio launch wrapper
+  addins/                     Fusion add-ins installed into the prefix
   patches/                    Wine window fixes
 LICENSE                       Project license and retained third-party notices
 ```

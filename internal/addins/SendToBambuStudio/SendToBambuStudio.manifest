@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "ceaff656-02cc-4046-b2d9-1750890d2a38",
+  "author": "fusion-on-wine",
+  "description": {
+    "": "Export the design as STL and open it in the native Linux Bambu Studio."
+  },
+  "version": "1.1.0",
+  "runOnStartup": true,
+  "supportedOS": "windows",
+  "editEnabled": true
+}
