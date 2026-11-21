@@ -225,6 +225,8 @@ It separately repairs modal stacking, palette focus, and missed palette geometry
 Wine's `WM_NORMAL_HINTS` retain the application-requested palette position and fixed size even when Hyprland moves the X11 window itself.
 The helper restores those coordinates instead of copying the misplaced X11 position or guessing offsets from the main window.
 It refuses ambiguous window matches and acts only on its Fusion process.
+Hyprland 0.57 replaced `hyprctl dispatch NAME ARGS` with Lua dispatchers such as `hl.dsp.window.move({...})`.
+The helper detects which form the running compositor accepts and remembers it; with the old syntax on 0.57, palette repair, dimmer opacity, and modal restacking silently stopped working.
 Application-menu launches can omit `HYPRLAND_INSTANCE_SIGNATURE`; the launcher recovers it by matching `WAYLAND_DISPLAY` to `hyprctl -j instances`.
 It does not choose between ambiguous sessions or require compositor patches.
 The geometry compatibility fix requires scale-1 monitors; opacity translation does not.

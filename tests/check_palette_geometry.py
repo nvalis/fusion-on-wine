@@ -15,6 +15,7 @@ import time
 from Xlib import X, Xutil, display
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from internal.helpers import windows
 from internal.runtime import ROOT, hyprland_signature
 
 
@@ -32,7 +33,7 @@ def main():
     def hypr(*arguments):
         return subprocess.check_output(["hyprctl", *arguments], env=env, text=True, timeout=3).strip()
 
-    if any(w["id"] == args.workspace for w in json.loads(hypr("-j", "workspaces"))):
+    if any(w.get("id") == args.workspace for w in json.loads(hypr("-j", "workspaces"))):
         parser.error("Choose a workspace that does not already exist")
     monitors = json.loads(hypr("-j", "monitors"))
     if not monitors or any(m["scale"] != 1 for m in monitors):
@@ -71,9 +72,9 @@ def main():
                 if time.monotonic() > deadline:
                     raise RuntimeError("Synthetic palette did not appear")
                 time.sleep(.05)
-            address = "address:" + clients[0]["address"]
-            assert hypr("dispatch", "movetoworkspacesilent", f"{args.workspace},{address}") == "ok"
-            assert hypr("dispatch", "movewindowpixel", f"exact {displaced[0]} {displaced[1]},{address}") == "ok"
+            address = clients[0]["address"]
+            windows.dispatch(windows.move_to_workspace(args.workspace, address))
+            windows.dispatch(windows.move_window(*displaced, address))
             process = subprocess.Popen(
                 [sys.executable, ROOT / "internal/helpers/windows.py", "--pid", str(os.getpid())],
                 env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -94,7 +95,7 @@ def main():
                     time.sleep(.05)
 
             wait_for_repair()
-            assert hypr("dispatch", "movewindowpixel", f"exact {displaced[0]} {displaced[1]},{address}") == "ok"
+            windows.dispatch(windows.move_window(*displaced, address))
             wait_for_repair()
             print("PASS: initial and later displacement repaired in X11 and Hyprland")
         except Exception:

@@ -6,8 +6,10 @@ from unittest.mock import call, patch
 from Xlib import Xutil
 
 from internal.helpers.windows import (
-    WindowInfo, Watcher, associate_clients, geometry_commands, is_overlay, requested_geometry,
+    Dispatch, WindowInfo, Watcher, associate_clients, geometry_commands, is_overlay, move_window,
+    requested_geometry,
 )
+from internal.helpers import windows
 
 
 class OverlayTests(unittest.TestCase):
@@ -59,8 +61,16 @@ class GeometryTests(unittest.TestCase):
     def test_restores_win32_position_not_compositor_position(self):
         self.assertEqual(self.info.requested_rect, (4844, 349, 250, 453))
         self.assertEqual(geometry_commands(self.info, self.client), [
-            "dispatch movewindowpixel exact 4844 349,address:0x123",
+            move_window(4844, 349, "0x123"),
         ])
+
+    def test_special_workspace_without_id(self):
+        # Hyprland 0.57 omits "id" on special workspaces.
+        client = {**self.client, "at": [4844, 349], "workspace": {"id": 3, "name": "3"}}
+        owner = {**self.client, "address": "0x9", "workspace": {"name": "special:fusion"}}
+        self.assertEqual(geometry_commands(self.info, client, owner),
+                         [windows.move_to_workspace("special:fusion", "0x123")])
+        self.assertEqual(geometry_commands(self.info, {**client, "workspace": owner["workspace"]}, owner), [])
 
     def test_association_still_uses_actual_geometry(self):
         other = replace(self.info, xid=8, rect=(2971, 179, 300, 1160))
@@ -226,6 +236,55 @@ class OpacityTests(unittest.TestCase):
                 clients = associate_clients(self.infos, [unrelated], {})
                 self.sync(clients=clients)
                 self.setprop.assert_not_called()
+
+
+class DispatchTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(windows, "_dialect", None))
+
+    def test_renders_both_dialects(self):
+        self.assertEqual(move_window(4844, 349, "0x123"), Dispatch(
+            "movewindowpixel exact 4844 349,address:0x123",
+            'hl.dsp.window.move({ x = 4844, y = 349, window = "address:0x123" })',
+        ))
+        self.assertEqual(windows.set_window_prop("0x1", "opacity", "0.3").lua,
+                         'hl.dsp.window.set_prop({ prop = "opacity", value = "0.3", window = "address:0x1" })')
+        self.assertEqual(windows.move_to_workspace("special:a", "0x1").lua,
+                         'hl.dsp.window.move({ workspace = "special:a", follow = false, window = "address:0x1" })')
+
+    def test_lua_hyprland_is_detected_and_remembered(self):
+        hypr = self.enterContext(patch.object(windows, "hypr", return_value="ok"))
+        windows.dispatch(move_window(1, 2, "0x1"))
+        windows.dispatch(move_window(1, 2, "0x1"), move_window(3, 4, "0x2"))
+        self.assertEqual(windows._dialect, "lua")
+        self.assertEqual(hypr.call_args_list, [
+            call("dispatch", 'hl.dsp.window.move({ x = 1, y = 2, window = "address:0x1" })'),
+            call("--batch", 'dispatch hl.dsp.window.move({ x = 1, y = 2, window = "address:0x1" });'
+                            'dispatch hl.dsp.window.move({ x = 3, y = 4, window = "address:0x2" })'),
+        ])
+
+    def test_legacy_hyprland_falls_back(self):
+        def hypr(*args):
+            return "ok" if args[1].startswith("movewindowpixel") else "Invalid dispatcher"
+        self.enterContext(patch.object(windows, "hypr", side_effect=hypr))
+        windows.dispatch(move_window(1, 2, "0x1"))
+        self.assertEqual(windows._dialect, "legacy")
+
+    def test_lua_errors_and_failed_batches_raise(self):
+        # Hyprland 0.57 exits non-zero for a legacy command and reports errors inline in batches.
+        self.enterContext(patch.object(windows, "hypr", side_effect=[
+            RuntimeError(), "ok\n\nerror: window not found",
+        ]))
+        with self.assertRaises(RuntimeError):
+            windows.dispatch(move_window(1, 2, "0x1"), move_window(3, 4, "0x2"))
+        self.assertIsNone(windows._dialect)
+
+    def test_setprop_uses_old_ipc_request_last(self):
+        hypr = self.enterContext(patch.object(windows, "hypr", side_effect=[
+            "Invalid dispatcher", "Invalid dispatcher", "ok",
+        ]))
+        windows.setprop("0x1", "opacity", "0.5")
+        self.assertEqual(hypr.call_args_list[-1], call("setprop", "address:0x1", "opacity", "0.5"))
 
 
 if __name__ == "__main__":

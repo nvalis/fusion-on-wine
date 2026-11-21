@@ -112,6 +112,57 @@ def associate_clients(infos, clients, previous):
     return result
 
 
+@dataclass(frozen=True)
+class Dispatch:
+    """One compositor request in both Hyprland IPC dialects.
+
+    Hyprland 0.57 replaced `hyprctl dispatch NAME ARGS` with Lua expressions
+    such as `hl.dsp.window.move({...})`; older releases reject the Lua form.
+    """
+    legacy: str
+    lua: str
+
+
+def lua_string(value):
+    # Addresses, workspace names, and numeric strings only; quote defensively.
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def move_to_workspace(target, address):
+    return Dispatch(f"movetoworkspacesilent {target},address:{address}",
+                    f"hl.dsp.window.move({{ workspace = {lua_string(target)}, follow = false, "
+                    f"window = {lua_string('address:' + address)} }})")
+
+
+def move_window(x, y, address):
+    return Dispatch(f"movewindowpixel exact {x} {y},address:{address}",
+                    f"hl.dsp.window.move({{ x = {int(x)}, y = {int(y)}, "
+                    f"window = {lua_string('address:' + address)} }})")
+
+
+def resize_window(width, height, address):
+    return Dispatch(f"resizewindowpixel exact {width} {height},address:{address}",
+                    f"hl.dsp.window.resize({{ x = {int(width)}, y = {int(height)}, "
+                    f"window = {lua_string('address:' + address)} }})")
+
+
+def focus_window(address):
+    return Dispatch(f"focuswindow address:{address}",
+                    f"hl.dsp.focus({{ window = {lua_string('address:' + address)} }})")
+
+
+def raise_window(address):
+    return Dispatch("bringactivetotop",
+                    f"hl.dsp.window.alter_zorder({{ mode = \"top\", "
+                    f"window = {lua_string('address:' + address)} }})")
+
+
+def set_window_prop(address, name, value):
+    return Dispatch(f"setprop address:{address} {name} {value}",
+                    f"hl.dsp.window.set_prop({{ prop = {lua_string(name)}, value = {lua_string(value)}, "
+                    f"window = {lua_string('address:' + address)} }})")
+
+
 def geometry_commands(info, client, owner_client=None):
     """Restore application-requested geometry without guessing offsets from the owner."""
     if not info.override_redirect or not client.get("floating") or client.get("fullscreen", 0):
@@ -119,23 +170,30 @@ def geometry_commands(info, client, owner_client=None):
     rect = info.requested_rect or info.rect
     if client.get("hidden") or min(rect[2:]) <= 1:
         return []
-    address = "address:" + client["address"]
+    address = client["address"]
     commands = []
-    if owner_client is not None and client["workspace"]["id"] != owner_client["workspace"]["id"]:
-        workspace = owner_client["workspace"]["name"]
+
+    def workspace_key(c):
+        # Hyprland 0.57 omits "id" for special workspaces; names stay unique.
+        return c["workspace"].get("id"), c["workspace"].get("name")
+
+    if owner_client is not None and workspace_key(client) != workspace_key(owner_client):
+        workspace = owner_client["workspace"].get("name", "")
         if workspace.startswith("special:"):
             # Do not put batch-command delimiters from a custom name into IPC.
             name = workspace[len("special:"):]
             target = workspace if name and all(c.isalnum() or c in "_.-" for c in name) else None
-        else:
+        elif owner_client["workspace"].get("id") is not None:
             target = str(owner_client["workspace"]["id"])
+        else:
+            target = None
         if target is not None:
-            commands.append(f"dispatch movetoworkspacesilent {target},{address}")
+            commands.append(move_to_workspace(target, address))
     x, y, width, height = rect
     if any(abs(a - b) > 2 for a, b in zip(client["at"], (x, y))):
-        commands.append(f"dispatch movewindowpixel exact {x} {y},{address}")
+        commands.append(move_window(x, y, address))
     if any(abs(a - b) > 2 for a, b in zip(client["size"], (width, height))):
-        commands.append(f"dispatch resizewindowpixel exact {width} {height},{address}")
+        commands.append(resize_window(width, height, address))
     return commands
 
 
@@ -172,12 +230,43 @@ def hypr(*args):
     return result.stdout.strip()
 
 
-def setprop(address, name, value):
-    # Hyprland 0.56 moved setprop to a dispatcher. Support the older IPC form too.
-    if hypr("dispatch", "setprop", f"address:{address} {name} {value}") == "ok":
+# Which dispatch dialect this Hyprland accepts; learned from the first success.
+_dialect = None
+
+
+def _run_dispatches(commands, dialect):
+    lines = [getattr(command, dialect) for command in commands]
+    try:
+        if len(lines) == 1:
+            result = hypr("dispatch", lines[0])
+        else:
+            result = hypr("--batch", ";".join("dispatch " + line for line in lines))
+    except RuntimeError:
+        return False
+    replies = [line.strip() for line in result.splitlines() if line.strip()]
+    return bool(replies) and all(reply == "ok" for reply in replies)
+
+
+def dispatch(*commands):
+    """Send Dispatch requests, detecting the legacy or Lua IPC dialect once."""
+    global _dialect
+    if not commands:
         return
-    if hypr("setprop", f"address:{address}", name, value) != "ok":
-        raise RuntimeError("Hyprland rejected window property")
+    order = (_dialect,) if _dialect else ("lua", "legacy")
+    for dialect in order:
+        if _run_dispatches(commands, dialect):
+            _dialect = dialect
+            return
+    raise RuntimeError("Hyprland rejected dispatch")
+
+
+def setprop(address, name, value):
+    try:
+        dispatch(set_window_prop(address, name, value))
+    except RuntimeError:
+        # Hyprland before 0.56 exposed setprop as its own IPC request.
+        if hypr("setprop", f"address:{address}", name, value) != "ok":
+            raise RuntimeError("Hyprland rejected window property") from None
 
 
 class Watcher:
@@ -343,9 +432,7 @@ class Watcher:
                 commands.extend(changes)
                 repaired.append(xid)
         if commands:
-            result = hypr("--batch", ";".join(commands))
-            if any(line.strip() != "ok" for line in result.splitlines() if line.strip()):
-                raise RuntimeError("Hyprland rejected palette geometry")
+            dispatch(*commands)
             for xid in repaired:
                 if xid not in self.geometry_reported:
                     print("Repaired unmanaged palette geometry", flush=True)
@@ -377,9 +464,10 @@ class Watcher:
         if state.get("dialog") != dialog["address"]:
             active = json.loads(hypr("-j", "activewindow"))
             if active.get("pid") == self.pid:
-                if hypr("dispatch", "focuswindow", "address:" + dialog["address"]) != "ok":
-                    return False
-                if hypr("dispatch", "bringactivetotop") != "ok":
+                try:
+                    dispatch(focus_window(dialog["address"]))
+                    dispatch(raise_window(dialog["address"]))
+                except RuntimeError:
                     return False
             # Keep the X11 order consistent with Hyprland's floating-window order.
             window.configure(stack_mode=X.Above)
