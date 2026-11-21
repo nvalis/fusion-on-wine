@@ -92,7 +92,8 @@ class HyprlandSessionTests(unittest.TestCase):
             settings = Settings(home, home / "prefix", home / "runtime", home / "cache",
                                 home / "logs", home / "python", home / "config.json")
             self.environment["DISPLAY"] = ":0"
-            self.run.side_effect = [self.run.return_value, subprocess.CompletedProcess([], 0)]
+            version = subprocess.CompletedProcess([], 0, stdout=json.dumps({"version": "0.57.0"}))
+            self.run.side_effect = [self.run.return_value, subprocess.CompletedProcess([], 0), version]
             process = Mock(pid=12345)
             process.wait.return_value = 0
             popen = self.enterContext(patch("internal.runtime.subprocess.Popen", return_value=process))
@@ -112,6 +113,7 @@ class HyprlandSessionTests(unittest.TestCase):
                 self.assertEqual(invocation.kwargs["env"]["HYPRLAND_INSTANCE_SIGNATURE"], "desktop")
                 self.assertEqual(invocation.kwargs["env"]["WINEPREFIX"], str(settings.prefix))
                 self.assertNotIn("WAYLAND_DISPLAY", invocation.kwargs["env"])
+            self.assertEqual(fusion.kwargs["env"]["FUSION_WINE_EMBED_PALETTES"], "1")
             self.assertNotIn("HYPRLAND_INSTANCE_SIGNATURE", self.environment)
 
     def test_malformed_instance_list(self):
@@ -119,6 +121,31 @@ class HyprlandSessionTests(unittest.TestCase):
         self.assertEqual(hyprland_signature(), "")
         self.set_instances({"invalid": "object"})
         self.assertEqual(hyprland_signature(), "")
+
+
+class PaletteContainmentTests(unittest.TestCase):
+    def settings(self):
+        home = Path("/nonexistent")
+        return Settings(home, home / "prefix", home / "runtime", home / "cache",
+                        home / "logs", home / "python", home / "config.json")
+
+    def env(self, environment, **kwargs):
+        with patch.dict("os.environ", environment, clear=True):
+            return self.settings().env(fusion=True, **kwargs)
+
+    def test_enabled_on_hyprland_and_sway(self):
+        self.assertEqual(self.env({}, hyprland="desktop")["FUSION_WINE_EMBED_PALETTES"], "1")
+        self.assertEqual(self.env({"SWAYSOCK": "/run/sway"})["FUSION_WINE_EMBED_PALETTES"], "1")
+
+    def test_opt_out_is_not_forwarded(self):
+        # Wine enables containment for any set value, including "0".
+        env = self.env({"FUSION_WINE_EMBED_PALETTES": "0"}, hyprland="desktop")
+        self.assertNotIn("FUSION_WINE_EMBED_PALETTES", env)
+
+    def test_other_compositors_and_setup_are_unchanged(self):
+        self.assertNotIn("FUSION_WINE_EMBED_PALETTES", self.env({}))
+        with patch.dict("os.environ", {"SWAYSOCK": "/run/sway"}, clear=True):
+            self.assertNotIn("FUSION_WINE_EMBED_PALETTES", self.settings().env())
 
 
 if __name__ == "__main__":

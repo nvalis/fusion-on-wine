@@ -287,5 +287,51 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(hypr.call_args_list[-1], call("setprop", "address:0x1", "opacity", "0.5"))
 
 
+class IpcTests(unittest.TestCase):
+    def test_requests_match_hyprctl_wire_format(self):
+        self.assertEqual(windows.hyprctl_request(["-j", "clients"]), "j/clients")
+        self.assertEqual(windows.hyprctl_request(["dispatch", "hl.dsp.window.move({ x = 1 })"]),
+                         "/dispatch hl.dsp.window.move({ x = 1 })")
+        self.assertEqual(windows.hyprctl_request(["--batch", "dispatch a;dispatch b"]),
+                         "[[BATCH]]dispatch a;dispatch b")
+        self.assertEqual(windows.hyprctl_request(["setprop", "address:0x1", "opacity", "0.5"]),
+                         "/setprop address:0x1 opacity 0.5")
+
+    def test_missing_socket_is_a_reported_failure(self):
+        with patch.dict("os.environ", {"HYPRLAND_INSTANCE_SIGNATURE": "missing",
+                                       "XDG_RUNTIME_DIR": "/nonexistent"}):
+            with self.assertRaises(RuntimeError):
+                windows.hypr("-j", "clients")
+
+
+class FailureLogTests(unittest.TestCase):
+    def test_reports_first_then_rate_limits_with_count(self):
+        now = [0.0]
+        log = windows.FailureLog(interval=60, clock=lambda: now[0])
+        printed = self.enterContext(patch("builtins.print"))
+        log.report("geometry", RuntimeError("Hyprland rejected dispatch"))
+        for _ in range(5):
+            now[0] += 1
+            log.report("geometry", RuntimeError("Hyprland rejected dispatch"))
+        self.assertEqual(printed.call_count, 1)
+        now[0] = 61
+        log.report("geometry", RuntimeError("Hyprland rejected dispatch"))
+        self.assertEqual(printed.call_count, 2)
+        self.assertIn("(6 times)", printed.call_args.args[0])
+
+    def test_distinct_failures_are_each_reported(self):
+        log = windows.FailureLog(clock=lambda: 0)
+        printed = self.enterContext(patch("builtins.print"))
+        log.report("geometry", RuntimeError("a"))
+        log.report("geometry", KeyError("id"))
+        log.report("focus", RuntimeError("a"))
+        self.assertEqual(printed.call_count, 3)
+
+    def test_reply_shape_errors_are_caught(self):
+        for failure in (KeyError("id"), TypeError(), json.JSONDecodeError("x", "", 0)):
+            with self.subTest(failure=failure):
+                self.assertIsInstance(failure, windows.REPAIR_ERRORS)
+
+
 if __name__ == "__main__":
     unittest.main()

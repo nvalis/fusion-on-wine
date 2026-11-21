@@ -49,8 +49,11 @@ class Settings:
     def server(self):
         return self.runtime / "bin/wineserver"
 
-    def env(self, *, fusion=False):
+    def env(self, *, fusion=False, hyprland=""):
         env = dict(os.environ)
+        if hyprland:
+            # Menu launches can omit the signature; hyprland_signature() recovers it.
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = hyprland
         env.update(WINEPREFIX=str(self.prefix), WINESERVER=str(self.server), WINEARCH="win64",
                    WINEDEBUG=env.get("WINEDEBUG", "-all,err+all"), QTWEBENGINE_DISABLE_SANDBOX="1",
                    QTWEBENGINE_CHROMIUM_FLAGS=env.get("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox"),
@@ -62,11 +65,15 @@ class Settings:
         env.pop("WINEBOOTSTRAPMODE", None)
         env.pop("WINEDLLOVERRIDES", None)
         env.pop("FUSION_WINE_MANAGED_PALETTES", None)
+        # FUSION_WINE_EMBED_PALETTES=0 opts out; Wine treats any set value as enabled.
+        embed = os.environ.get("FUSION_WINE_EMBED_PALETTES", "1") != "0"
         env.pop("FUSION_WINE_EMBED_PALETTES", None)
         # Presentation synchronization belongs to Fusion, not prefix setup or sign-in.
         env.pop("FUSION_WINE_SYNC_PRESENT", None)
         env.pop("FUSION_WINE_READBACK_PRESENT", None)  # retired diagnostic switch
-        if fusion and env.get("SWAYSOCK"):
+        if fusion and embed and (env.get("SWAYSOCK") or env.get("HYPRLAND_INSTANCE_SIGNATURE")):
+            # Wine makes Fusion's palettes X11 children of the main window, so
+            # the compositor neither places them nor needs helper repairs.
             env["FUSION_WINE_EMBED_PALETTES"] = "1"
         if fusion:
             # Fusion ships its own compilers. Wine's compiler breaks OGS shading and redraws.
@@ -395,6 +402,38 @@ def hyprland_signature():
     return matches[0] if matches else ""
 
 
+def hyprland_version(signature):
+    result = subprocess.run(["hyprctl", "-i", signature, "-j", "version"],
+                            capture_output=True, text=True, timeout=3)
+    return json.loads(result.stdout)["version"]
+
+
+def check_hyprland_version(signature):
+    try:
+        version = hyprland_version(signature)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        print("Warning: could not read the Hyprland version. Run ./fusion.sh doctor.")
+        return
+    tested = manifest()["hyprland"]["tested_version"]
+    if version != tested:
+        print(f"Warning: Hyprland {version} is not the tested release {tested}. "
+              "Check ./fusion.sh doctor and the helper log if popups misbehave.")
+
+
+def hyprland_dispatch_dialect(signature):
+    """Probe with a move of a nonexistent window, which every release accepts as a no-op."""
+    probes = {
+        "lua": 'hl.dsp.window.move({ x = 0, y = 0, window = "address:0x0" })',
+        "legacy": "movewindowpixel exact 0 0,address:0x0",
+    }
+    for dialect, probe in probes.items():
+        result = subprocess.run(["hyprctl", "-i", signature, "dispatch", probe],
+                                capture_output=True, text=True, timeout=3)
+        if result.returncode == 0 and result.stdout.strip() == "ok":
+            return dialect
+    return None
+
+
 def launch(settings):
     from .setup import host_check
     host_check()
@@ -418,9 +457,9 @@ def launch(settings):
             print(f"Warning: Fusion {version} is not the tested release {manifest()['fusion']['tested_version']}.")
         settings.logs.mkdir(parents=True, exist_ok=True, mode=0o700)
         settings.logs.chmod(0o700)
-        env = settings.env(fusion=True)
         if signature:
-            env["HYPRLAND_INSTANCE_SIGNATURE"] = signature
+            check_hyprland_version(signature)
+        env = settings.env(fusion=True, hyprland=signature)
         with (settings.logs / "fusion.log").open("a") as log:
             process = subprocess.Popen([settings.wine, executable], cwd=executable.parent, env=env,
                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -519,14 +558,36 @@ def doctor(settings):
         problems.append(str(error))
     if signature:
         if shutil.which("hyprctl"):
-            result = subprocess.run(["hyprctl", "-i", signature, "version"], capture_output=True, text=True)
-            print(result.stdout.splitlines()[0] if result.stdout else "Hyprland IPC unavailable")
-            monitors = subprocess.run(["hyprctl", "-i", signature, "-j", "monitors"], capture_output=True, text=True)
+            tested = spec["hyprland"]["tested_version"]
             try:
-                if any(m["scale"] != 1 for m in json.loads(monitors.stdout)):
-                    print("Warning: palette geometry compatibility fix is disabled on scaled monitors.")
-            except (ValueError, KeyError, TypeError):
-                problems.append("Could not query Hyprland monitors.")
+                version = hyprland_version(signature)
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+                problems.append("Hyprland IPC is unavailable.")
+            else:
+                print("Hyprland", version, "(tested: " + tested + ")")
+                if version != tested:
+                    print(f"Warning: Hyprland {version} is not the tested release {tested}.")
+                try:
+                    dialect = hyprland_dispatch_dialect(signature)
+                except (OSError, subprocess.SubprocessError):
+                    dialect = None
+                if dialect:
+                    print("Hyprland dispatchers:", "Lua (hl.dsp)" if dialect == "lua" else "legacy")
+                else:
+                    print("Warning: Hyprland accepted neither dispatcher syntax; "
+                          "popup opacity and placement repairs will fail.")
+            embedded = settings.env(fusion=True, hyprland=signature).get("FUSION_WINE_EMBED_PALETTES") == "1"
+            if embedded:
+                print("Palettes: contained in the Fusion window by Wine; works on scaled monitors.")
+            else:
+                print("Palettes: containment disabled; the helper repairs placement.")
+                monitors = subprocess.run(["hyprctl", "-i", signature, "-j", "monitors"],
+                                          capture_output=True, text=True)
+                try:
+                    if any(m["scale"] != 1 for m in json.loads(monitors.stdout)):
+                        print("Warning: palette geometry compatibility fix is disabled on scaled monitors.")
+                except (ValueError, KeyError, TypeError):
+                    problems.append("Could not query Hyprland monitors.")
         else:
             problems.append("Hyprland session detected but hyprctl is missing.")
     elif os.environ.get("SWAYSOCK"):

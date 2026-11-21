@@ -174,13 +174,23 @@
      if (!XQueryTree( data->display, window, &xroot, &xparent, &xchildren, &nchildren )) xparent = root_window;
      else XFree( xchildren );
      if (X11DRV_check_error()) WARN( "window %lx already destroyed\n", window );
-@@ -1405,6 +1408,49 @@
+@@ -1405,6 +1408,62 @@
      }
  }
  
 +/* Keep Win32 popups, but make their X11 surfaces children of the owner. This
 + * leaves placement/stacking with the application while the compositor sees one
 + * toplevel. Do not use the XEMBED path: it deliberately suppresses movement. */
++static BOOL is_constant_alpha_popup( HWND hwnd )
++{
++    DWORD flags;
++    BYTE alpha;
++
++    if (!(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED)) return FALSE;
++    if (!NtUserGetLayeredWindowAttributes( hwnd, NULL, &alpha, &flags )) return FALSE;
++    return (flags & LWA_ALPHA) && alpha < 255;
++}
++
 +Window get_fusion_palette_parent( HWND hwnd )
 +{
 +    static const WCHAR palette_title[] = {'F','u','s','i','o','n','3','6','0',0};
@@ -191,6 +201,9 @@
 +
 +    if (!getenv( "FUSION_WINE_EMBED_PALETTES" )) return 0;
 +    if ((style & (WS_CHILD | WS_POPUP | WS_CAPTION)) != WS_POPUP) return 0;
++    /* Constant-alpha dimmers need compositor blending, which a child window
++     * cannot get; it would be drawn solid black. Leave them toplevel. */
++    if (is_constant_alpha_popup( hwnd )) return 0;
 +    if (!NtUserInternalGetWindowText( hwnd, title, ARRAY_SIZE(title) )) return 0;
 +    if (wcscmp( title, palette_title ) && wcsncmp( title, hud_prefix, 4 )) return 0;
 +    if (!(owner = NtUserGetWindowRelative( hwnd, GW_OWNER ))) return 0;

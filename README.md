@@ -62,11 +62,13 @@ sudo apt install build-essential gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
 Launch through `./fusion.sh` or the application menu entry "Autodesk Fusion".
 Desktop registration reuses the installed Fusion logo when available and backs up the older duplicate shortcut before removing it.
 The launcher follows normal desktop tiling rules rather than forcing a floating window or fixed size.
-On Sway, Wine contains Fusion's owned captionless `Fusion360` and `HUD:` palette surfaces inside their main X11 owner window.
-Fusion still sees Windows popups and controls their placement and stacking; Sway no longer treats them as separate floating dialogs.
-This uses neither a Wine virtual desktop nor a Sway placement helper or global window rules.
+On Sway and Hyprland, Wine contains Fusion's owned captionless `Fusion360` and `HUD:` palette surfaces inside their main X11 owner window.
+Fusion still sees Windows popups and controls their placement and stacking; the compositor no longer places them as separate windows, so placement also works on scaled monitors.
+This uses neither a Wine virtual desktop nor global window rules.
+Set `FUSION_WINE_EMBED_PALETTES=0` before launching to opt out; on Hyprland the helper then repairs palette placement instead.
 Palettes follow their owner across workspaces and are clipped to its bounds: they cannot extend outside the main window or onto a second monitor independently.
-Ordinary titled dialogs, menus, and tooltips retain the existing handling; owned `Fusion360` modal overlay surfaces are contained too.
+Ordinary titled dialogs, menus, and tooltips retain the existing handling.
+Constant-alpha surfaces such as the dimmer behind File > New stay toplevel: a contained child gets no compositor blending and would be drawn solid black.
 After updating the Wine patches, save and close Fusion and its Wine services, then rerun `./install.sh --accept-third-party-licenses` to rebuild the runtime.
 Contained ARGB palettes use alpha-derived bounding masks rather than top-level compositor blending.
 A 50% alpha cutoff omits faint edges and shadows instead of turning their premultiplied pixels into black borders; opaque black UI is preserved.
@@ -221,7 +223,7 @@ Autodesk's Qt DLLs and certificate verification remain unchanged.
 On Hyprland, the helper translates `_NET_WM_WINDOW_OPACITY` for every Fusion window that requests it, regardless of its title, type, owner, or size.
 Hyprland 0.56.2 does not apply this X11 property itself, so Wine's constant-alpha dimmers otherwise appear solid black.
 The helper follows opacity changes and restores full opacity when Wine removes the property.
-It separately repairs modal stacking, palette focus, and missed palette geometry updates.
+It separately repairs modal stacking and, when palette containment is disabled, palette focus and missed palette geometry updates.
 Wine's `WM_NORMAL_HINTS` retain the application-requested palette position and fixed size even when Hyprland moves the X11 window itself.
 The helper restores those coordinates instead of copying the misplaced X11 position or guessing offsets from the main window.
 It refuses ambiguous window matches and acts only on its Fusion process.
@@ -229,7 +231,10 @@ Hyprland 0.57 replaced `hyprctl dispatch NAME ARGS` with Lua dispatchers such as
 The helper detects which form the running compositor accepts and remembers it; with the old syntax on 0.57, palette repair, dimmer opacity, and modal restacking silently stopped working.
 Application-menu launches can omit `HYPRLAND_INSTANCE_SIGNATURE`; the launcher recovers it by matching `WAYLAND_DISPLAY` to `hyprctl -j instances`.
 It does not choose between ambiguous sessions or require compositor patches.
-The geometry compatibility fix requires scale-1 monitors; opacity translation does not.
+The helper talks to Hyprland's request socket directly instead of spawning `hyprctl` per query.
+It logs each distinct repair failure to `overlays.log` once, then at most once a minute with a repeat count, and keeps running.
+`./fusion.sh doctor` and the launcher warn when Hyprland differs from the tested release; doctor also reports which dispatcher syntax the compositor accepts.
+The uncontained geometry fix requires scale-1 monitors; opacity translation and containment do not.
 
 ## Compatibility and privacy
 

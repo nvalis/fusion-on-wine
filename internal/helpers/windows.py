@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import select
 import socket
-import subprocess
 import time
 from dataclasses import dataclass
 
@@ -223,12 +222,67 @@ def is_focusable_palette(window):
     )
 
 
-def hypr(*args):
-    result = subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=3)
-    if result.returncode:
-        raise RuntimeError("Hyprland IPC command failed")
-    return result.stdout.strip()
+def hyprland_socket(name):
+    """Return an existing Hyprland IPC socket path, preferring XDG_RUNTIME_DIR."""
+    signature = os.environ["HYPRLAND_INSTANCE_SIGNATURE"]
+    candidates = [Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "hypr" / signature / name,
+                  Path("/tmp/hypr") / signature / name]
+    return next((path for path in candidates if path.exists()), candidates[0])
 
+
+def hyprctl_request(args):
+    """Encode hyprctl-style arguments as one raw request-socket message."""
+    args = list(args)
+    flags = ""
+    if args and args[0] == "-j":
+        flags, args = "j", args[1:]
+    if args and args[0] == "--batch":
+        return "[[BATCH]]" + " ".join(args[1:])
+    return flags + "/" + " ".join(args)
+
+
+def hypr(*args):
+    # Talk to the request socket directly. Spawning hyprctl for every poll
+    # costs a process per query on a 20 ms loop.
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(3)
+    try:
+        connection.connect(str(hyprland_socket(".socket.sock")))
+        connection.sendall(hyprctl_request(args).encode())
+        chunks = []
+        while chunk := connection.recv(65536):
+            chunks.append(chunk)
+    except OSError as error:
+        raise RuntimeError("Hyprland IPC request failed") from error
+    finally:
+        connection.close()
+    return b"".join(chunks).decode(errors="replace").strip()
+
+
+class FailureLog:
+    """Report each distinct repair failure once, then at most once a minute."""
+
+    def __init__(self, interval=60, clock=time.monotonic):
+        self.interval = interval
+        self.clock = clock
+        self.seen = {}
+
+    def report(self, area, error):
+        key = (area, type(error).__name__, str(error))
+        now = self.clock()
+        last, count = self.seen.get(key, (None, 0))
+        count += 1
+        if last is None or now - last >= self.interval:
+            repeat = f" ({count} times)" if count > 1 else ""
+            print(f"Hyprland {area} failed{repeat}: {type(error).__name__}: {error}", flush=True)
+            self.seen[key] = (now, 0)
+        else:
+            self.seen[key] = (last, count)
+
+
+# Compositor replies can be absent or change shape across Hyprland releases.
+# Report them instead of letting one bad reply end the helper.
+REPAIR_ERRORS = (RuntimeError, ValueError, KeyError, TypeError, error.XError)
 
 # Which dispatch dialect this Hyprland accepts; learned from the first success.
 _dialect = None
@@ -281,17 +335,16 @@ class Watcher:
             "WM_PROTOCOLS", "WM_TAKE_FOCUS", "WM_NORMAL_HINTS",
         )}
         self.events = None
-        signature = os.environ["HYPRLAND_INSTANCE_SIGNATURE"]
-        for base in (Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")), Path("/tmp")):
-            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                connection.connect(str(base / "hypr" / signature / ".socket2.sock"))
-            except OSError:
-                connection.close()
-            else:
-                connection.setblocking(False)
-                self.events = connection
-                break
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(str(hyprland_socket(".socket2.sock")))
+        except OSError:
+            connection.close()
+        else:
+            connection.setblocking(False)
+            self.events = connection
+        self.failures = FailureLog()
+        self.focus_reported = set()
         self.event_buffer = b""
         self.focus_pending = True
         self.focus_deadline = time.monotonic() + 3
@@ -503,7 +556,9 @@ class Watcher:
                 ))
                 window.set_input_focus(X.RevertToParent, X.CurrentTime)
                 self.display.flush()
-                print("Repaired unmanaged palette X11 focus", flush=True)
+                if window.id not in self.focus_reported:
+                    print("Repaired unmanaged palette X11 focus", flush=True)
+                    self.focus_reported.add(window.id)
             return True
         return False  # Native metadata and compositor state can arrive separately.
 
@@ -543,6 +598,7 @@ class Watcher:
                         self.queue_focus()
                 elif event.type in (X.DestroyNotify, X.UnmapNotify):
                     self.tracked.discard(xid)
+                    self.focus_reported.discard(xid)
                     self.pending.pop(xid, None)
                     self.client_addresses.pop(xid, None)
                     self.geometry_reported.discard(xid)
@@ -561,14 +617,15 @@ class Watcher:
             if self.geometry_pending and time.monotonic() >= self.next_geometry_poll:
                 try:
                     self.sync_windows()
-                except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, error.XError):
-                    pass
+                except REPAIR_ERRORS as failure:
+                    self.failures.report("geometry/opacity sync", failure)
                 self.geometry_pending = False
                 self.next_geometry_poll = time.monotonic() + 0.02
             if self.focus_pending:
                 try:
                     done = self.sync_focus()
-                except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, error.XError):
+                except REPAIR_ERRORS as failure:
+                    self.failures.report("palette focus", failure)
                     done = False
                 if done or time.monotonic() > self.focus_deadline:
                     self.focus_pending = False
@@ -576,7 +633,8 @@ class Watcher:
                 info = self.read(self.display.create_resource_object("window", xid))
                 try:
                     done = info is None or self.fix(info)
-                except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, error.XError):
+                except REPAIR_ERRORS as failure:
+                    self.failures.report("modal overlay repair", failure)
                     done = False
                 if done or time.monotonic() > deadline:
                     self.pending.pop(xid, None)

@@ -25,6 +25,9 @@
     "url": "https://dl.appstreaming.autodesk.com/production/installers/Fusion%20Client%20Downloader.exe",
     "tested_version": "2705.1.30"
   },
+  "hyprland": {
+    "tested_version": "0.57.0"
+  },
   "python_requirements": [
     "python-xlib==0.33",
     "six==1.17.0"
